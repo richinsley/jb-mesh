@@ -1,0 +1,74 @@
+name: embed
+version: 2.0.0
+description: |
+  Text embedding service using sentence-transformers.
+  Converts text to dense vector representations for semantic search,
+  similarity matching, and RAG applications.
+
+capabilities:
+  - generate text embeddings
+  - batch embedding support
+  - multiple model support
+
+runtime:
+  python: "3.11"
+  mode: persistent
+  entrypoint: main.py
+  startup_timeout: 120
+  packages:
+    - sentence-transformers
+    - torch
+    - pydantic>=2.0
+    - git+https://github.com/richinsley/jb-mesh.git#subdirectory=sdk/python/jb-service
+
+resources:
+  gpu: true
+  vram_gb: 2
+  ram_gb: 4
+
+health:
+  method: health
+  interval: 30
+  failure_threshold: 3
+
+rpc:
+  methods:
+    embed:
+      description: Generate embedding for a single text
+      input:
+        type: object
+        properties:
+          text: { type: string }
+        required: [text]
+      output:
+        type: object
+        properties:
+          embedding: { type: array }
+          dimensions: { type: integer }
+
+    embed_batch:
+      description: Generate embeddings for multiple texts
+      input:
+        type: object
+        properties:
+          texts: { type: array }
+        required: [texts]
+      output:
+        type: object
+        properties:
+          embeddings: { type: array }
+          count: { type: integer }
+
+    info:
+      description: Get model information
+
+    switch_model:
+      description: Switch to a different embedding model
+      input:
+        type: object
+        properties:
+          model: { type: string }
+        required: [model]
+
+    health:
+      description: Health check

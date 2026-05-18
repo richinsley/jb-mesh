@@ -1,0 +1,36 @@
+name: calculator
+version: 1.0.0
+description: A simple calculator service using jb-service SDK
+
+runtime:
+  python: "3.11"
+  mode: oneshot
+  packages:
+    - pydantic>=2.0
+    - git+https://github.com/richinsley/jb-mesh.git#subdirectory=sdk/python/jb-service
+
+rpc:
+  methods:
+    add:
+      description: Add two numbers
+      input:
+        type: object
+        properties:
+          a: { type: number }
+          b: { type: number }
+        required: [a, b]
+      output:
+        type: number
+    subtract:
+      description: Subtract b from a
+    multiply:
+      description: Multiply two numbers
+    divide:
+      description: Divide a by b
+    health:
+      description: Health check
+
+health:
+  method: health
+  interval: 30
+  failure_threshold: 3

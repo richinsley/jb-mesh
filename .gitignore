@@ -1,0 +1,22 @@
+/jb-mesh
+/jb-mesh-linux
+/jb-mesh-backup
+/jb-mesh-bin
+__pycache__/
+*.pyc
+*.exe
+*.dll
+*.so
+*.dylib
+# Binary artifacts
+jb-mesh-
+
+jb-mesh-new
+jb-mesh-backup
+jb-mesh-bin
+jb-mesh-linux
+.logstore*.md
+.logstore*/
+.pytest_cache/
+*.pyo
+*.pyd

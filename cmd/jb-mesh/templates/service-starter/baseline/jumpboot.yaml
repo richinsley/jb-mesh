@@ -1,0 +1,37 @@
+name: my-service
+version: 0.1.0
+description: Short description of what this service does
+
+runtime:
+  python: "3.11"
+  mode: oneshot
+  packages:
+    - pydantic>=2.0
+    - git+https://github.com/richinsley/jb-mesh.git#subdirectory=sdk/python/jb-service
+
+rpc:
+  methods:
+    ping:
+      description: Safe smoke method
+      input:
+        type: object
+        properties:
+          message: { type: string }
+      output:
+        type: object
+        properties:
+          ok: { type: boolean }
+          echo: { type: string }
+    health:
+      description: Health check
+
+health:
+  method: health
+  interval: 30
+  failure_threshold: 3
+
+x-deploy:
+  smoke:
+    method: ping
+    params:
+      message: smoke
