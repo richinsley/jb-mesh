@@ -18,7 +18,7 @@ import (
 // frame.
 //
 // Run with the dev mesh up on localhost:14222 and sleeptool v0.2.0+
-// installed (see DESIGN-STREAMING-CANCEL.md §8.3).
+// installed.
 //
 //	go test -tags=integration -v -count=1 -run TestPhase2_Stream ./pkg/mesh/
 func TestPhase2_StreamMultiFrame(t *testing.T) {

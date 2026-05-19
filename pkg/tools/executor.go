@@ -144,7 +144,7 @@ func (e *Executor) Call(toolName, methodName string, params map[string]interface
 // honored only as a pre-call check; the call itself runs to completion.
 //
 // Part of Phase 1 of the streaming+cancellation design — see
-// DESIGN-STREAMING-CANCEL.md in the repo root.
+// the streaming and cancellation design.
 func (e *Executor) CallContext(ctx context.Context, toolName, methodName string, params map[string]interface{}) (interface{}, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -206,7 +206,7 @@ func (e *Executor) callPersistentMsgpackCtx(ctx context.Context, tool *Tool, met
 // REPL transport can't carry multi-frame responses cleanly and is rejected
 // with a clear error.
 //
-// Phase 2 of DESIGN-STREAMING-CANCEL.md.
+// the streaming RPC support.
 func (e *Executor) CallStream(ctx context.Context, toolName, methodName string, params map[string]interface{}) (<-chan map[string]interface{}, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

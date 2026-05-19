@@ -542,12 +542,18 @@ func (n *Node) registerTool(tool *tools.Tool) error {
 		}
 	}
 
-	// Build method schemas from manifest input schemas
+	// Build method schemas from manifest input schemas. Streaming-method
+	// markers come from manifest.RPC.Methods[m].Stream and ride along in
+	// the same metadata so discovery-side consumers can distinguish
+	// streaming from non-streaming without extra round trips.
 	methodSchemas := make(map[string]mesh.MethodSchema)
 	for methodName, method := range manifest.RPC.Methods {
+		var ms mesh.MethodSchema
 		if method.Input != nil {
-			methodSchemas[methodName] = manifestSchemaToMeshSchema(method.Input)
+			ms = manifestSchemaToMeshSchema(method.Input)
 		}
+		ms.Stream = method.Stream
+		methodSchemas[methodName] = ms
 	}
 
 	// Register streaming subjects (Phase 2) for any methods declared with
@@ -636,7 +642,7 @@ func (n *Node) registerTool(tool *tools.Tool) error {
 }
 
 // registerStreamingSubjects wires raw NATS subscriptions for streaming
-// methods (Phase 2 of DESIGN-STREAMING-CANCEL.md). Each streaming method
+// methods. Each streaming method
 // gets two subjects: the load-balanced `tools.<tool>.<method>.stream` and
 // the node-targeted `node.<node>.tools.<tool>.<method>.stream`.
 //

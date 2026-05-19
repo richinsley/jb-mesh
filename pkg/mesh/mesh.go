@@ -29,12 +29,20 @@ type ToolEndpoint struct {
 	Subject string `json:"subject"`
 }
 
-// MethodSchema holds JSON Schema for a single method's input parameters
+// MethodSchema holds JSON Schema for a single method's input parameters,
+// plus per-method metadata not strictly part of JSON Schema.
 type MethodSchema struct {
 	Properties  map[string]interface{} `json:"properties,omitempty"`
 	Required    []string               `json:"required,omitempty"`
 	Description string                 `json:"description,omitempty"`
 	Type        string                 `json:"type,omitempty"`
+
+	// Stream is true when the method serves on the `.stream` subject. Callers
+	// can use this flag to choose Mesh.Stream vs Mesh.CallWithContext without
+	// an out-of-band registry.
+	// Omitted from JSON when false to keep wire compatibility with older
+	// non-streaming-aware consumers.
+	Stream bool `json:"stream,omitempty"`
 }
 
 // toolRegistration stores everything needed to re-register a tool after reconnect
@@ -129,7 +137,7 @@ func CancelSubject(callID string) string {
 // Done=true. The channel returned by Mesh.Stream is closed after the
 // terminal frame is delivered.
 //
-// Phase 2 of DESIGN-STREAMING-CANCEL.md.
+// the streaming RPC support.
 type StreamFrame struct {
 	Chunk  interface{} `json:"chunk,omitempty"`
 	Result interface{} `json:"result,omitempty"`
@@ -361,7 +369,7 @@ func (m *Mesh) Call(toolName, method string, params map[string]interface{}, time
 // derive ctx with context.WithTimeout.
 //
 // Part of Phase 1 of the streaming+cancellation design — see
-// DESIGN-STREAMING-CANCEL.md in the repo root.
+// the streaming and cancellation design.
 func (m *Mesh) CallWithContext(ctx context.Context, toolName, method string, params map[string]interface{}, targetNode ...string) (*CallResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -420,7 +428,7 @@ func (m *Mesh) CallWithContext(ctx context.Context, toolName, method string, par
 // CallWithContext). The channel is then closed without waiting for further
 // frames.
 //
-// Phase 2 of DESIGN-STREAMING-CANCEL.md.
+// the streaming RPC support.
 func (m *Mesh) Stream(ctx context.Context, toolName, method string, params map[string]interface{}, targetNode ...string) (<-chan StreamFrame, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

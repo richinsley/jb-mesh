@@ -22,7 +22,7 @@ caller via SendCancel → __cancel__).
 
 ``ctx.emit(chunk)`` is reserved for Phase 2 (streaming) and is currently a no-op.
 
-Part of the streaming+cancellation design — see jb-mesh/DESIGN-STREAMING-CANCEL.md.
+Part of jb-mesh streaming and cancellation support.
 """
 from __future__ import annotations
 from typing import Any, Callable, Optional

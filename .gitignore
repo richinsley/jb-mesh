@@ -20,3 +20,4 @@ jb-mesh-linux
 .pytest_cache/
 *.pyo
 *.pyd
+jbmesh

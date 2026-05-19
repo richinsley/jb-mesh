@@ -94,8 +94,7 @@ type Method struct {
 	Input       *Schema `yaml:"input,omitempty" json:"input,omitempty"`
 	Output      *Schema `yaml:"output,omitempty" json:"output,omitempty"`
 
-	// Stream marks the method as a streaming endpoint (Phase 2 of
-	// DESIGN-STREAMING-CANCEL.md). When true, the node registers a
+	// Stream marks the method as a streaming endpoint. When true, the node registers a
 	// `tools.<tool>.<method>.stream` subject in addition to the regular
 	// single-reply subject; callers using Mesh.Stream hit the streaming
 	// subject and receive multi-frame responses. Defaults to false.

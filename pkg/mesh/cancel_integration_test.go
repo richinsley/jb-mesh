@@ -16,7 +16,7 @@ import (
 //
 // Run with:
 //
-//	# Terminal 1: start dev mesh + install sleeptool (see DESIGN-STREAMING-CANCEL.md §8.3)
+//	# Terminal 1: start a dev mesh and install sleeptool
 //	# Terminal 2:
 //	go test -tags=integration -v -run TestPhase1_CancelEndToEnd ./pkg/mesh/
 //
