@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,7 @@ type toolRegistration struct {
 type Mesh struct {
 	nc            *nats.Conn
 	nodeName      string
+	log           meshLog
 	services      []micro.Service
 	nodeSubs      []*nats.Subscription // node-targeted direct subscriptions
 	fileStore     *filestore.Store     // file store for resolving file params
@@ -77,6 +79,38 @@ type Config struct {
 	NodeName  string              // Human-readable node name
 	Token     string              // Optional auth token
 	WebSocket NATSWebSocketConfig // Optional WebSocket client settings for ws:// or wss:// URLs
+	Logging   LoggingConfig       // Optional lifecycle logging policy
+}
+
+// LoggingConfig controls human-readable mesh lifecycle logs.
+type LoggingConfig struct {
+	// Quiet suppresses default package-log output. If Logger is set, logs are
+	// routed there even when Quiet is true.
+	Quiet bool
+
+	// Logger receives mesh lifecycle logs. Nil preserves the historical
+	// behavior of writing through the package log unless Quiet is true.
+	Logger *slog.Logger
+}
+
+type meshLog struct {
+	quiet  bool
+	logger *slog.Logger
+}
+
+func newMeshLog(cfg LoggingConfig) meshLog {
+	return meshLog{quiet: cfg.Quiet, logger: cfg.Logger}
+}
+
+func (l meshLog) printf(format string, args ...any) {
+	if l.logger != nil {
+		l.logger.Info(fmt.Sprintf(format, args...))
+		return
+	}
+	if l.quiet {
+		return
+	}
+	log.Printf(format, args...)
 }
 
 // New creates a new mesh instance and connects to NATS
@@ -87,16 +121,17 @@ func New(cfg Config) (*Mesh, error) {
 
 	m := &Mesh{
 		nodeName: cfg.NodeName,
+		log:      newMeshLog(cfg.Logging),
 	}
 
 	opts := []nats.Option{
 		nats.ReconnectWait(2 * time.Second),
 		nats.MaxReconnects(-1), // reconnect forever
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			log.Printf("[mesh] disconnected: %v", err)
+			m.logf("[mesh] disconnected: %v", err)
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			log.Printf("[mesh] reconnected to %s", nc.ConnectedUrl())
+			m.logf("[mesh] reconnected to %s", nc.ConnectedUrl())
 			go m.reRegisterTools()
 		}),
 	}
@@ -106,10 +141,18 @@ func New(cfg Config) (*Mesh, error) {
 		return nil, fmt.Errorf("failed to connect to NATS at %s: %w", cfg.NATSUrl, err)
 	}
 
-	log.Printf("[mesh] connected to %s as %q", nc.ConnectedUrl(), cfg.NodeName)
+	m.logf("[mesh] connected to %s as %q", nc.ConnectedUrl(), cfg.NodeName)
 
 	m.nc = nc
 	return m, nil
+}
+
+func (m *Mesh) logf(format string, args ...any) {
+	if m == nil {
+		m.logf(format, args...)
+		return
+	}
+	m.log.printf(format, args...)
 }
 
 // CallRequest is the JSON payload for a tool method call
@@ -249,7 +292,7 @@ func (m *Mesh) registerToolLocked(toolName, version, description string, methods
 			if m.fileStore != nil {
 				cleanup, resolveErr := ResolveFileParams(callReq.Params, m.fileStore, m.nc)
 				if resolveErr != nil {
-					log.Printf("[mesh] file resolve error: %v", resolveErr)
+					m.logf("[mesh] file resolve error: %v", resolveErr)
 				}
 				if cleanup != nil {
 					defer cleanup()
@@ -272,7 +315,7 @@ func (m *Mesh) registerToolLocked(toolName, version, description string, methods
 			return fmt.Errorf("failed to register endpoint %s.%s: %w", toolName, method, err)
 		}
 
-		log.Printf("[mesh] registered tools.%s.%s", toolName, methodName)
+		m.logf("[mesh] registered tools.%s.%s", toolName, methodName)
 
 		// Also register a node-targeted direct subscription:
 		// node.<nodeName>.tools.<tool>.<method>
@@ -296,7 +339,7 @@ func (m *Mesh) registerToolLocked(toolName, version, description string, methods
 			if m.fileStore != nil {
 				cleanup, resolveErr := ResolveFileParams(callReq.Params, m.fileStore, m.nc)
 				if resolveErr != nil {
-					log.Printf("[mesh] file resolve error: %v", resolveErr)
+					m.logf("[mesh] file resolve error: %v", resolveErr)
 				}
 				if cleanup != nil {
 					defer cleanup()
@@ -315,7 +358,7 @@ func (m *Mesh) registerToolLocked(toolName, version, description string, methods
 			msg.Respond(data)
 		})
 		if err != nil {
-			log.Printf("[mesh] warning: failed to register node-targeted %s: %v", nodeSubject, err)
+			m.logf("[mesh] warning: failed to register node-targeted %s: %v", nodeSubject, err)
 		} else {
 			m.nodeSubs = append(m.nodeSubs, nodeSub)
 		}
@@ -398,7 +441,7 @@ func (m *Mesh) CallWithContext(ctx context.Context, toolName, method string, par
 		// serving node can propagate to jumpboot. We don't wait for an ack.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if pubErr := m.nc.Publish(CancelSubject(callID), nil); pubErr != nil {
-				log.Printf("[mesh] CallWithContext: cancel publish for %s failed: %v", callID, pubErr)
+				m.logf("[mesh] CallWithContext: cancel publish for %s failed: %v", callID, pubErr)
 			}
 			return nil, ctxErr
 		}
@@ -488,7 +531,7 @@ func (m *Mesh) Stream(ctx context.Context, toolName, method string, params map[s
 				case out <- frame:
 				case <-ctx.Done():
 					if pubErr := m.nc.Publish(CancelSubject(callID), nil); pubErr != nil {
-						log.Printf("[mesh] Stream: cancel publish for %s failed: %v", callID, pubErr)
+						m.logf("[mesh] Stream: cancel publish for %s failed: %v", callID, pubErr)
 					}
 					return
 				}
@@ -497,7 +540,7 @@ func (m *Mesh) Stream(ctx context.Context, toolName, method string, params map[s
 				}
 			case <-ctx.Done():
 				if pubErr := m.nc.Publish(CancelSubject(callID), nil); pubErr != nil {
-					log.Printf("[mesh] Stream: cancel publish for %s failed: %v", callID, pubErr)
+					m.logf("[mesh] Stream: cancel publish for %s failed: %v", callID, pubErr)
 				}
 				return
 			}
@@ -611,7 +654,7 @@ func (m *Mesh) reRegisterTools() {
 		return
 	}
 
-	log.Printf("[mesh] re-registering %d tool(s) after reconnect...", len(m.registrations))
+	m.logf("[mesh] re-registering %d tool(s) after reconnect...", len(m.registrations))
 
 	// Stop old services and subscriptions — they're zombies after reconnect
 	for _, svc := range m.services {
@@ -627,16 +670,16 @@ func (m *Mesh) reRegisterTools() {
 	// Re-register each saved tool
 	for _, reg := range m.registrations {
 		if err := m.registerToolLocked(reg.name, reg.version, reg.description, reg.methods, reg.methodSchemas, reg.handler, false); err != nil {
-			log.Printf("[mesh] ERROR: failed to re-register tool %s: %v", reg.name, err)
+			m.logf("[mesh] ERROR: failed to re-register tool %s: %v", reg.name, err)
 		} else {
-			log.Printf("[mesh] re-registered tool %s (%d methods)", reg.name, len(reg.methods))
+			m.logf("[mesh] re-registered tool %s (%d methods)", reg.name, len(reg.methods))
 		}
 	}
 
 	// Emit node.joined event so the seed knows we're back
 	m.nc.Publish("events.node.joined", []byte(fmt.Sprintf(`{"node":"%s","event":"reconnect"}`, m.nodeName)))
 
-	log.Printf("[mesh] reconnect re-registration complete")
+	m.logf("[mesh] reconnect re-registration complete")
 }
 
 // UnregisterTool removes a tool's service registration from the mesh.
@@ -696,7 +739,7 @@ func (m *Mesh) SubscribeUninstall(handler func(toolName string, removeEnv bool) 
 			return
 		}
 
-		log.Printf("[mesh] uninstall request: %s", req.ToolName)
+		m.logf("[mesh] uninstall request: %s", req.ToolName)
 		err := handler(req.ToolName, req.RemoveEnv)
 		var resp UninstallResult
 		if err != nil {
@@ -710,7 +753,7 @@ func (m *Mesh) SubscribeUninstall(handler func(toolName string, removeEnv bool) 
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", subject, err)
 	}
-	log.Printf("[mesh] listening for uninstall requests on %s", subject)
+	m.logf("[mesh] listening for uninstall requests on %s", subject)
 	return nil
 }
 
@@ -762,7 +805,7 @@ func (m *Mesh) SubscribeUpdate(handler func(toolName string, clean bool) (oldVer
 			return
 		}
 
-		log.Printf("[mesh] update request: %s", req.ToolName)
+		m.logf("[mesh] update request: %s", req.ToolName)
 		// Run the potentially slow update in a background goroutine so the
 		// callback can return and the NATS connection stays responsive.
 		go func() {
@@ -780,7 +823,7 @@ func (m *Mesh) SubscribeUpdate(handler func(toolName string, clean bool) (oldVer
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", subject, err)
 	}
-	log.Printf("[mesh] listening for update requests on %s", subject)
+	m.logf("[mesh] listening for update requests on %s", subject)
 	return nil
 }
 
@@ -842,7 +885,7 @@ func (m *Mesh) SubscribeConfig(handler func(toolName, action string, values map[
 			return
 		}
 
-		log.Printf("[mesh] config %s request: %s", req.Action, req.ToolName)
+		m.logf("[mesh] config %s request: %s", req.Action, req.ToolName)
 		cfg, err := handler(req.ToolName, req.Action, req.Values)
 		var resp ConfigResult
 		if err != nil {
@@ -856,7 +899,7 @@ func (m *Mesh) SubscribeConfig(handler func(toolName, action string, values map[
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", subject, err)
 	}
-	log.Printf("[mesh] listening for config requests on %s", subject)
+	m.logf("[mesh] listening for config requests on %s", subject)
 	return nil
 }
 
@@ -904,7 +947,7 @@ func (m *Mesh) SubscribeReleaseInspect(handler func(toolName string) (*ReleaseIn
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", subject, err)
 	}
-	log.Printf("[mesh] listening for release inspection requests on %s", subject)
+	m.logf("[mesh] listening for release inspection requests on %s", subject)
 	return nil
 }
 
@@ -973,7 +1016,7 @@ func (m *Mesh) SubscribeInstall(handler func(source string) (string, string, err
 			return
 		}
 
-		log.Printf("[mesh] install request: %s", req.Source)
+		m.logf("[mesh] install request: %s", req.Source)
 		// Run the potentially slow install in a background goroutine so the
 		// callback can return and the NATS connection stays responsive.
 		go func() {
@@ -991,7 +1034,7 @@ func (m *Mesh) SubscribeInstall(handler func(source string) (string, string, err
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", subject, err)
 	}
-	log.Printf("[mesh] listening for install requests on %s", subject)
+	m.logf("[mesh] listening for install requests on %s", subject)
 	return nil
 }
 
@@ -1070,11 +1113,11 @@ func (m *Mesh) SubscribeToolSchema(handler func(toolName string) (map[string]int
 			return
 		}
 		toolName := parts[3]
-		log.Printf("[mesh] schema request for tool: %s", toolName)
+		m.logf("[mesh] schema request for tool: %s", toolName)
 		schema, err := handler(toolName)
 		var resp SchemaResult
 		if err != nil {
-			log.Printf("[mesh] schema handler error for %s: %v", toolName, err)
+			m.logf("[mesh] schema handler error for %s: %v", toolName, err)
 			resp = SchemaResult{OK: false, Error: err.Error()}
 		} else {
 			resp = SchemaResult{OK: true, Schema: schema}
@@ -1085,6 +1128,6 @@ func (m *Mesh) SubscribeToolSchema(handler func(toolName string) (map[string]int
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", subject, err)
 	}
-	log.Printf("[mesh] listening for schema requests on %s", subject)
+	m.logf("[mesh] listening for schema requests on %s", subject)
 	return nil
 }

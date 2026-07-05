@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -148,11 +149,39 @@ func UserEvent(node, topic string, data map[string]interface{}) Event {
 type Bus struct {
 	nc       *nats.Conn
 	nodeName string
+	log      eventLog
 }
 
 // NewBus creates an event bus attached to a NATS connection.
 func NewBus(nc *nats.Conn, nodeName string) *Bus {
 	return &Bus{nc: nc, nodeName: nodeName}
+}
+
+// LoggingConfig controls human-readable event-bus logs.
+type LoggingConfig struct {
+	Quiet  bool
+	Logger *slog.Logger
+}
+
+// NewBusWithLogging creates an event bus with an explicit logging policy.
+func NewBusWithLogging(nc *nats.Conn, nodeName string, cfg LoggingConfig) *Bus {
+	return &Bus{nc: nc, nodeName: nodeName, log: eventLog{quiet: cfg.Quiet, logger: cfg.Logger}}
+}
+
+type eventLog struct {
+	quiet  bool
+	logger *slog.Logger
+}
+
+func (l eventLog) printf(format string, args ...any) {
+	if l.logger != nil {
+		l.logger.Info(fmt.Sprintf(format, args...))
+		return
+	}
+	if l.quiet {
+		return
+	}
+	log.Printf(format, args...)
 }
 
 // Emit publishes an event to the appropriate NATS subject.
@@ -173,7 +202,7 @@ func (b *Bus) Emit(event Event) error {
 		return fmt.Errorf("publish event %s: %w", subject, err)
 	}
 
-	log.Printf("[events] emitted %s", event.Type)
+	b.log.printf("[events] emitted %s", event.Type)
 	return nil
 }
 
@@ -191,7 +220,7 @@ func (b *Bus) Subscribe(pattern string, handler EventHandler) (*nats.Subscriptio
 	sub, err := b.nc.Subscribe(pattern, func(msg *nats.Msg) {
 		var event Event
 		if err := json.Unmarshal(msg.Data, &event); err != nil {
-			log.Printf("[events] failed to unmarshal event on %s: %v", msg.Subject, err)
+			b.log.printf("[events] failed to unmarshal event on %s: %v", msg.Subject, err)
 			return
 		}
 		handler(event)

@@ -1,11 +1,16 @@
 package node
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +23,94 @@ import (
 	"github.com/richinsley/jb-mesh/pkg/state"
 	"github.com/richinsley/jb-mesh/pkg/tools"
 )
+
+func TestNewQuietEmbeddedNodeSuppressesLifecycleLogs(t *testing.T) {
+	var logBuf bytes.Buffer
+	oldLogWriter := log.Writer()
+	oldLogFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(oldLogWriter)
+		log.SetFlags(oldLogFlags)
+	}()
+
+	readStdout := captureFileOutput(t, &os.Stdout)
+	readStderr := captureFileOutput(t, &os.Stderr)
+
+	n, err := New(Config{
+		NodeName:  "quiet-node",
+		HomeDir:   t.TempDir(),
+		NoMDNS:    true,
+		Role:      "seed",
+		LeafPort:  -1,
+		EmbedPort: -1,
+		Logging:   LoggingConfig{Quiet: true},
+	})
+	if err != nil {
+		t.Fatalf("New quiet node: %v", err)
+	}
+	n.Close()
+
+	stdout := readStdout()
+	stderr := readStderr()
+	if got := logBuf.String(); got != "" {
+		t.Fatalf("quiet node wrote package logs: %q", got)
+	}
+	if strings.Contains(stdout+stderr, "[node]") || strings.Contains(stdout+stderr, "[mesh]") || strings.Contains(stdout+stderr, "[INF]") {
+		t.Fatalf("quiet node wrote lifecycle logs to stdio: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+func TestSlogNATSLoggerRoutesMessages(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	natsLogger := slogNATSLogger{logger: logger}
+
+	natsLogger.Noticef("server %s", "ready")
+	natsLogger.Warnf("server %s", "warn")
+	natsLogger.Debugf("server %s", "debug")
+
+	got := buf.String()
+	for _, want := range []string{"server ready", "server warn", "server debug"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("slog NATS logger output %q missing %q", got, want)
+		}
+	}
+}
+
+func captureFileOutput(t *testing.T, target **os.File) func() string {
+	t.Helper()
+	old := *target
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	*target = w
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			closed = true
+			_ = w.Close()
+			*target = old
+			_ = r.Close()
+		}
+	})
+	return func() string {
+		if closed {
+			return ""
+		}
+		closed = true
+		_ = w.Close()
+		*target = old
+		data, err := io.ReadAll(r)
+		_ = r.Close()
+		if err != nil {
+			t.Fatalf("read captured output: %v", err)
+		}
+		return string(data)
+	}
+}
 
 func TestShouldDemote_NewerNodeDemotes(t *testing.T) {
 	n := &Node{

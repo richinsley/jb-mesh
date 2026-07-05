@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/url"
 	"sort"
@@ -41,6 +42,8 @@ type Node struct {
 	logQueryService  *logstore.QueryService
 	logStateStore    *state.Store
 	logProducer      *logstore.Producer
+	log              nodeLog
+	logging          LoggingConfig
 	natsServer       *natsserver.Server   // non-nil if embedded
 	discovery        *discovery.Discovery // non-nil if mDNS enabled
 	nodeName         string
@@ -71,12 +74,97 @@ type Config struct {
 	LeafPort      int    // embedded NATS leaf-node bind port for seed role
 	WebsocketHost string // embedded NATS websocket bind host; empty disables websocket
 	WebsocketPort int    // embedded NATS websocket bind port
+	Logging       LoggingConfig
 
 	// EmbedPort overrides the embedded NATS client port. If zero, the value
 	// from <HomeDir>/jb-mesh.yaml is used, falling back to DefaultNATSPort
 	// (4222). Pass -1 to bind a random free port — useful for parallel
 	// tests or running multiple in-process nodes on one host.
 	EmbedPort int
+}
+
+// LoggingConfig controls human-readable node and embedded-NATS lifecycle logs.
+type LoggingConfig struct {
+	// Quiet suppresses default package-log output. If Logger or NATSLogger is
+	// set, logs are routed there even when Quiet is true.
+	Quiet bool
+
+	// Logger receives jb-mesh node/mesh lifecycle logs. Nil preserves the
+	// historical behavior of writing through the package log unless Quiet is true.
+	Logger *slog.Logger
+
+	// NATSLogger receives embedded NATS server logs. If nil and Logger is set,
+	// embedded NATS logs are adapted into Logger. If both are nil and Quiet is
+	// true, NATS Options.NoLog is enabled.
+	NATSLogger natsserver.Logger
+
+	// NATSDebug and NATSTrace are passed to embedded NATS when a custom logger
+	// is configured.
+	NATSDebug bool
+	NATSTrace bool
+}
+
+type nodeLog struct {
+	quiet  bool
+	logger *slog.Logger
+}
+
+func newNodeLog(cfg LoggingConfig) nodeLog {
+	return nodeLog{quiet: cfg.Quiet, logger: cfg.Logger}
+}
+
+func (l nodeLog) printf(format string, args ...any) {
+	if l.logger != nil {
+		l.logger.Info(fmt.Sprintf(format, args...))
+		return
+	}
+	if l.quiet {
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func (n *Node) logf(format string, args ...any) {
+	if n == nil {
+		log.Printf(format, args...)
+		return
+	}
+	n.log.printf(format, args...)
+}
+
+type slogNATSLogger struct {
+	logger *slog.Logger
+}
+
+func (l slogNATSLogger) Noticef(format string, args ...any) {
+	l.log(slog.LevelInfo, format, args...)
+}
+
+func (l slogNATSLogger) Warnf(format string, args ...any) {
+	l.log(slog.LevelWarn, format, args...)
+}
+
+func (l slogNATSLogger) Fatalf(format string, args ...any) {
+	l.log(slog.LevelError, format, args...)
+}
+
+func (l slogNATSLogger) Errorf(format string, args ...any) {
+	l.log(slog.LevelError, format, args...)
+}
+
+func (l slogNATSLogger) Debugf(format string, args ...any) {
+	l.log(slog.LevelDebug, format, args...)
+}
+
+func (l slogNATSLogger) Tracef(format string, args ...any) {
+	l.log(slog.LevelDebug, format, args...)
+}
+
+func (l slogNATSLogger) log(level slog.Level, format string, args ...any) {
+	if l.logger == nil {
+		return
+	}
+	l.logger.Log(context.Background(), level, fmt.Sprintf(format, args...))
 }
 
 // New creates and starts a new node
@@ -92,6 +180,8 @@ func New(cfg Config) (*Node, error) {
 
 	n := &Node{
 		cfg:        jbCfg,
+		log:        newNodeLog(cfg.Logging),
+		logging:    cfg.Logging,
 		streamSubs: make(map[string][]*nats.Subscription),
 	}
 
@@ -132,23 +222,23 @@ func New(cfg Config) (*Node, error) {
 				Enabled:  true,
 			})
 			if err != nil {
-				log.Printf("[node] warning: failed to create discovery: %v", err)
+				n.logf("[node] warning: failed to create discovery: %v", err)
 			} else {
-				log.Printf("[node] browsing for mesh peers (timeout: %v)...", discovery.BrowseTimeout)
+				n.logf("[node] browsing for mesh peers (timeout: %v)...", discovery.BrowseTimeout)
 				peers, err := disc.Browse(discovery.BrowseTimeout)
 				if err != nil {
-					log.Printf("[node] warning: mDNS browse failed: %v", err)
+					n.logf("[node] warning: mDNS browse failed: %v", err)
 				}
-				log.Printf("[node] mDNS browse found %d peer(s)", len(peers))
+				n.logf("[node] mDNS browse found %d peer(s)", len(peers))
 
 				seed := discovery.FindSeed(peers)
 				if seed != nil {
 					role = "leaf"
 					leafRemotes = []string{seed.LeafURL()}
-					log.Printf("[node] discovered seed %s at %s, joining as leaf", seed.Name, seed.LeafURL())
+					n.logf("[node] discovered seed %s at %s, joining as leaf", seed.Name, seed.LeafURL())
 				} else {
 					role = "seed"
-					log.Printf("[node] no seed found, starting as seed")
+					n.logf("[node] no seed found, starting as seed")
 				}
 			}
 		}
@@ -156,7 +246,7 @@ func New(cfg Config) (*Node, error) {
 		// Default to seed if still undecided (mDNS disabled, no explicit role)
 		if role == "" {
 			role = "seed"
-			log.Printf("[node] defaulting to seed role (mDNS disabled)")
+			n.logf("[node] defaulting to seed role (mDNS disabled)")
 		}
 
 		// Start embedded NATS with determined role
@@ -170,6 +260,7 @@ func New(cfg Config) (*Node, error) {
 			LeafRemotes:   leafRemotes,
 			WebsocketHost: cfg.WebsocketHost,
 			WebsocketPort: cfg.WebsocketPort,
+			Logging:       cfg.Logging,
 		}
 		ns, err := startEmbeddedNATS(embeddedCfg)
 		if err != nil {
@@ -187,7 +278,7 @@ func New(cfg Config) (*Node, error) {
 		}
 		n.leafPort = leafPort
 		cfg.NATSUrl = ns.ClientURL()
-		log.Printf("[node] embedded NATS server running at %s (role=%s)", cfg.NATSUrl, role)
+		n.logf("[node] embedded NATS server running at %s (role=%s)", cfg.NATSUrl, role)
 
 		// Start mDNS advertisement after NATS is up
 		if !cfg.NoMDNS {
@@ -208,10 +299,10 @@ func New(cfg Config) (*Node, error) {
 					})
 				}
 				if err := disc.Start(); err != nil {
-					log.Printf("[node] warning: failed to start mDNS advertisement: %v", err)
+					n.logf("[node] warning: failed to start mDNS advertisement: %v", err)
 				} else {
 					n.discovery = disc
-					log.Printf("[node] mDNS discovery active (role=%s)", role)
+					n.logf("[node] mDNS discovery active (role=%s)", role)
 				}
 			}
 		}
@@ -234,6 +325,10 @@ func New(cfg Config) (*Node, error) {
 		NodeName:  cfg.NodeName,
 		Token:     cfg.Token,
 		WebSocket: cfg.NATSWebSocket,
+		Logging: mesh.LoggingConfig{
+			Quiet:  cfg.Logging.Quiet,
+			Logger: cfg.Logging.Logger,
+		},
 	})
 	if err != nil {
 		n.Close()
@@ -244,11 +339,14 @@ func New(cfg Config) (*Node, error) {
 	n.logProducer = logstore.NewProducer(m.Conn(), cfg.NodeName)
 
 	// Initialize event bus for lifecycle event emission
-	eventBus := events.NewBus(m.Conn(), cfg.NodeName)
+	eventBus := events.NewBusWithLogging(m.Conn(), cfg.NodeName, events.LoggingConfig{
+		Quiet:  cfg.Logging.Quiet,
+		Logger: cfg.Logging.Logger,
+	})
 	n.eventBus = eventBus
 
 	if err := n.startLoggingService(); err != nil {
-		log.Printf("[node] warning: failed to start logging service: %v", err)
+		n.logf("[node] warning: failed to start logging service: %v", err)
 	}
 	logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{Level: "info", Kind: "node", Message: "node connected", Data: map[string]any{"nats_url": cfg.NATSUrl, "role": n.role}})
 
@@ -261,28 +359,28 @@ func New(cfg Config) (*Node, error) {
 	if err := m.SubscribeInstall(func(source string) (string, string, error) {
 		return n.InstallTool(source)
 	}); err != nil {
-		log.Printf("[node] warning: failed to subscribe to install requests: %v", err)
+		n.logf("[node] warning: failed to subscribe to install requests: %v", err)
 	}
 
 	// Listen for remote uninstall requests
 	if err := m.SubscribeUninstall(func(toolName string, removeEnv bool) error {
 		return n.UninstallTool(toolName, removeEnv)
 	}); err != nil {
-		log.Printf("[node] warning: failed to subscribe to uninstall requests: %v", err)
+		n.logf("[node] warning: failed to subscribe to uninstall requests: %v", err)
 	}
 
 	// Listen for remote update requests
 	if err := m.SubscribeUpdate(func(toolName string, clean bool) (string, string, error) {
 		return n.UpdateTool(toolName, clean)
 	}); err != nil {
-		log.Printf("[node] warning: failed to subscribe to update requests: %v", err)
+		n.logf("[node] warning: failed to subscribe to update requests: %v", err)
 	}
 
 	// Listen for remote config requests
 	if err := m.SubscribeConfig(func(toolName, action string, values map[string]interface{}) (map[string]interface{}, error) {
 		return n.HandleConfig(toolName, action, values)
 	}); err != nil {
-		log.Printf("[node] warning: failed to subscribe to config requests: %v", err)
+		n.logf("[node] warning: failed to subscribe to config requests: %v", err)
 	}
 
 	// Listen for remote release inspection requests
@@ -293,14 +391,14 @@ func New(cfg Config) (*Node, error) {
 		}
 		return releaseInspectionToMesh(inspection), nil
 	}); err != nil {
-		log.Printf("[node] warning: failed to subscribe to release inspection requests: %v", err)
+		n.logf("[node] warning: failed to subscribe to release inspection requests: %v", err)
 	}
 
 	// Listen for schema requests (node.<nodename>.tools.<tool>.schema)
 	if err := m.SubscribeToolSchema(func(toolName string) (map[string]interface{}, error) {
 		return n.GetToolSchema(toolName)
 	}); err != nil {
-		log.Printf("[node] warning: failed to subscribe to schema requests: %v", err)
+		n.logf("[node] warning: failed to subscribe to schema requests: %v", err)
 	}
 
 	// Register all installed tools into the mesh.
@@ -325,7 +423,7 @@ func New(cfg Config) (*Node, error) {
 	})
 	for _, tool := range startupTools {
 		if err := n.registerTool(tool); err != nil {
-			log.Printf("[node] warning: failed to register %s: %v", tool.Name, err)
+			n.logf("[node] warning: failed to register %s: %v", tool.Name, err)
 		}
 	}
 
@@ -349,20 +447,20 @@ func New(cfg Config) (*Node, error) {
 	if err := eventBus.Emit(events.NodeJoined(cfg.NodeName, map[string]interface{}{
 		"tools": len(manager.List()),
 	})); err != nil {
-		log.Printf("[node] warning: failed to emit node.joined: %v", err)
+		n.logf("[node] warning: failed to emit node.joined: %v", err)
 	}
 
 	// Register file store NATS handlers (shared bucket across all nodes)
 	js, err := m.Conn().JetStream()
 	if err != nil {
-		log.Printf("[node] warning: failed to get JetStream context: %v", err)
+		n.logf("[node] warning: failed to get JetStream context: %v", err)
 	} else {
 		store, err := filestore.NewStore(js, filestore.DefaultConfig())
 		if err != nil {
-			log.Printf("[node] warning: failed to create file store: %v", err)
+			n.logf("[node] warning: failed to create file store: %v", err)
 		} else {
 			if err := m.SubscribeFileHandlers(store); err != nil {
-				log.Printf("[node] warning: failed to register file store handlers: %v", err)
+				n.logf("[node] warning: failed to register file store handlers: %v", err)
 			}
 			m.SetFileStore(store) // Enable file param resolution in tool calls
 		}
@@ -385,6 +483,7 @@ type embeddedNATSConfig struct {
 	Role          string // "seed" or "leaf"
 	WebsocketHost string // optional websocket bind host
 	WebsocketPort int    // optional websocket bind port
+	Logging       LoggingConfig
 
 	// Seed-only: port for incoming leaf node connections (default 7422)
 	LeafPort int
@@ -407,12 +506,13 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 	if port == 0 {
 		port = DefaultNATSPort
 	}
+	logCfg := newNodeLog(cfg.Logging)
 
 	opts := &natsserver.Options{
 		Host:           "0.0.0.0",
 		Port:           port,
 		ServerName:     cfg.NodeName,
-		NoLog:          false,
+		NoLog:          cfg.Logging.Quiet && cfg.Logging.Logger == nil && cfg.Logging.NATSLogger == nil,
 		NoSigs:         true,
 		MaxControlLine: 4096,
 		JetStream:      true,
@@ -433,7 +533,7 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 			Port:  cfg.WebsocketPort,
 			NoTLS: true, // Portal terminates public TLS; keep lab listener private.
 		}
-		log.Printf("[node] NATS websocket listener enabled on %s:%d", wsHost, cfg.WebsocketPort)
+		logCfg.printf("[node] NATS websocket listener enabled on %s:%d", wsHost, cfg.WebsocketPort)
 	}
 
 	switch cfg.Role {
@@ -446,14 +546,14 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 			Host: "0.0.0.0",
 			Port: leafPort,
 		}
-		log.Printf("[node] NATS seed: clients on :%d, leaf connections on :%d", port, leafPort)
+		logCfg.printf("[node] NATS seed: clients on :%d, leaf connections on :%d", port, leafPort)
 
 	case "leaf":
 		var remotes []*natsserver.RemoteLeafOpts
 		for _, remote := range cfg.LeafRemotes {
 			u, err := url.Parse(remote)
 			if err != nil {
-				log.Printf("[node] warning: invalid leaf remote URL %q: %v", remote, err)
+				logCfg.printf("[node] warning: invalid leaf remote URL %q: %v", remote, err)
 				continue
 			}
 			remotes = append(remotes, &natsserver.RemoteLeafOpts{
@@ -466,7 +566,7 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 		opts.LeafNode = natsserver.LeafNodeOpts{
 			Remotes: remotes,
 		}
-		log.Printf("[node] NATS leaf: clients on :%d, connecting to seed(s): %v", port, cfg.LeafRemotes)
+		logCfg.printf("[node] NATS leaf: clients on :%d, connecting to seed(s): %v", port, cfg.LeafRemotes)
 
 	default:
 		return nil, fmt.Errorf("unknown NATS role: %q (expected \"seed\" or \"leaf\")", cfg.Role)
@@ -477,7 +577,13 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 		return nil, err
 	}
 
-	ns.ConfigureLogger()
+	if cfg.Logging.NATSLogger != nil {
+		ns.SetLogger(cfg.Logging.NATSLogger, cfg.Logging.NATSDebug, cfg.Logging.NATSTrace)
+	} else if cfg.Logging.Logger != nil {
+		ns.SetLogger(slogNATSLogger{logger: cfg.Logging.Logger}, cfg.Logging.NATSDebug, cfg.Logging.NATSTrace)
+	} else {
+		ns.ConfigureLogger()
+	}
 	go ns.Start()
 
 	if !ns.ReadyForConnections(5 * time.Second) {
@@ -511,7 +617,7 @@ func (n *Node) registerTool(tool *tools.Tool) error {
 
 	// Auto-start persistent tools
 	if manifest.Runtime.Mode == "persistent" {
-		log.Printf("[node] starting persistent tool %s...", tool.Name)
+		n.logf("[node] starting persistent tool %s...", tool.Name)
 		startAt := time.Now()
 		if err := n.executor.Start(tool.Name); err != nil {
 			logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{
@@ -537,7 +643,7 @@ func (n *Node) registerTool(tool *tools.Tool) error {
 		// Emit tool.started event
 		if n.eventBus != nil {
 			if emitErr := n.eventBus.Emit(events.ToolStarted(n.nodeName, tool.Name)); emitErr != nil {
-				log.Printf("[node] warning: failed to emit tool.started: %v", emitErr)
+				n.logf("[node] warning: failed to emit tool.started: %v", emitErr)
 			}
 		}
 	}
@@ -563,7 +669,7 @@ func (n *Node) registerTool(tool *tools.Tool) error {
 	// Mesh.Stream against the .stream subject.
 	if err := n.registerStreamingSubjects(tool, manifest); err != nil {
 		// Log but don't fail registration; the single-reply path still works.
-		log.Printf("[node] warning: streaming subjects for %s: %v", tool.Name, err)
+		n.logf("[node] warning: streaming subjects for %s: %v", tool.Name, err)
 	}
 
 	// Register into mesh — the handler bridges NATS calls to jumpboot.
@@ -605,7 +711,7 @@ func (n *Node) registerTool(tool *tools.Tool) error {
 					cancel()
 				})
 				if subErr != nil {
-					log.Printf("[node] cancel-subject subscribe failed for %s: %v", cancelID, subErr)
+					n.logf("[node] cancel-subject subscribe failed for %s: %v", cancelID, subErr)
 					// Continue without cancellation rather than failing the call.
 					result, err = n.executor.Call(tool.Name, method, params)
 				} else {
@@ -682,7 +788,7 @@ func (n *Node) registerStreamingSubjects(tool *tools.Tool, manifest *config.Mani
 			return fmt.Errorf("subscribe %s: %w", nodeSubject, err)
 		}
 		subs = append(subs, s1, s2)
-		log.Printf("[mesh] registered streaming %s", subject)
+		n.logf("[mesh] registered streaming %s", subject)
 	}
 
 	if len(subs) > 0 {
@@ -703,7 +809,7 @@ func (n *Node) unregisterStreamingSubjects(toolName string) {
 	n.streamSubsMu.Unlock()
 	for _, s := range subs {
 		if err := s.Unsubscribe(); err != nil {
-			log.Printf("[node] unsubscribe streaming for %s: %v", toolName, err)
+			n.logf("[node] unsubscribe streaming for %s: %v", toolName, err)
 		}
 	}
 }
@@ -744,7 +850,7 @@ func (n *Node) handleStreamRequest(toolName, methodName string, msg *nats.Msg) {
 			cancel()
 		})
 		if err != nil {
-			log.Printf("[node] stream cancel-sub for %s failed: %v", callID, err)
+			n.logf("[node] stream cancel-sub for %s failed: %v", callID, err)
 		} else {
 			defer cancelSub.Unsubscribe()
 		}
@@ -772,11 +878,11 @@ func (n *Node) handleStreamRequest(toolName, methodName string, msg *nats.Msg) {
 		}
 		data, mErr := json.Marshal(frame)
 		if mErr != nil {
-			log.Printf("[node] stream frame marshal for %s.%s: %v", toolName, methodName, mErr)
+			n.logf("[node] stream frame marshal for %s.%s: %v", toolName, methodName, mErr)
 			continue
 		}
 		if pubErr := n.mesh.Conn().Publish(msg.Reply, data); pubErr != nil {
-			log.Printf("[node] stream frame publish for %s.%s: %v", toolName, methodName, pubErr)
+			n.logf("[node] stream frame publish for %s.%s: %v", toolName, methodName, pubErr)
 			streamErr = pubErr
 			break
 		}
@@ -811,11 +917,11 @@ func (n *Node) publishStreamErrorFrame(replyInbox, errMsg string) {
 	frame := mesh.StreamFrame{Error: errMsg, Done: true, Node: n.nodeName}
 	data, err := json.Marshal(frame)
 	if err != nil {
-		log.Printf("[node] stream error-frame marshal: %v", err)
+		n.logf("[node] stream error-frame marshal: %v", err)
 		return
 	}
 	if pubErr := n.mesh.Conn().Publish(replyInbox, data); pubErr != nil {
-		log.Printf("[node] stream error-frame publish: %v", pubErr)
+		n.logf("[node] stream error-frame publish: %v", pubErr)
 	}
 }
 
@@ -833,13 +939,13 @@ func (n *Node) InstallTool(source string) (string, string, error) {
 		return tool.Name, tool.Manifest.Version, fmt.Errorf("installed but failed to register: %w", err)
 	}
 
-	log.Printf("[node] installed and registered %s v%s from %s", tool.Name, tool.Manifest.Version, source)
+	n.logf("[node] installed and registered %s v%s from %s", tool.Name, tool.Manifest.Version, source)
 	logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{Level: "info", Kind: "tool", Tool: tool.Name, Duration: time.Since(started), OK: logstore.BoolPtr(true), Message: "tool installed", Data: map[string]any{"version": tool.Manifest.Version, "source": source}})
 
 	// Emit tool.installed event
 	if n.eventBus != nil {
 		if err := n.eventBus.Emit(events.ToolInstalled(n.nodeName, tool.Name, tool.Manifest.Version)); err != nil {
-			log.Printf("[node] warning: failed to emit tool.installed: %v", err)
+			n.logf("[node] warning: failed to emit tool.installed: %v", err)
 		}
 	}
 
@@ -897,12 +1003,12 @@ func (n *Node) HandleConfig(toolName, action string, values map[string]interface
 		// Emit tool.configured event
 		if n.eventBus != nil {
 			if err := n.eventBus.Emit(events.ToolConfigured(n.nodeName, toolName, values)); err != nil {
-				log.Printf("[node] warning: failed to emit tool.configured: %v", err)
+				n.logf("[node] warning: failed to emit tool.configured: %v", err)
 			}
 		}
 		// If tool is running and persistent, restart it to pick up new config
 		if tool.Status == "running" && tool.Manifest.Runtime.Mode == "persistent" {
-			log.Printf("[node] config changed for running tool %s — restarting", toolName)
+			n.logf("[node] config changed for running tool %s — restarting", toolName)
 			if err := n.executor.Stop(toolName); err != nil {
 				return nil, fmt.Errorf("failed to stop for config reload: %w", err)
 			}
@@ -927,11 +1033,11 @@ func (n *Node) UpdateTool(toolName string, clean bool) (string, string, error) {
 
 	oldVersion := tool.Manifest.Version
 	wasRunning := tool.Status == "running"
-	log.Printf("[node] UpdateTool start: tool=%s oldVersion=%s wasRunning=%t clean=%t", toolName, oldVersion, wasRunning, clean)
+	n.logf("[node] UpdateTool start: tool=%s oldVersion=%s wasRunning=%t clean=%t", toolName, oldVersion, wasRunning, clean)
 
 	// Stop if running — with hard timeout to survive mutex contention.
 	if wasRunning {
-		log.Printf("[node] UpdateTool stopping %s", toolName)
+		n.logf("[node] UpdateTool stopping %s", toolName)
 		stopDone := make(chan error, 1)
 		go func() {
 			stopDone <- n.executor.Stop(toolName)
@@ -939,16 +1045,16 @@ func (n *Node) UpdateTool(toolName string, clean bool) (string, string, error) {
 		select {
 		case err := <-stopDone:
 			if err != nil {
-				log.Printf("[node] UpdateTool stop error for %s: %v", toolName, err)
+				n.logf("[node] UpdateTool stop error for %s: %v", toolName, err)
 				// Stop failed — try force-kill via executor if possible
 				if fErr := n.executor.ForceKill(toolName); fErr != nil {
-					log.Printf("[node] UpdateTool force-kill also failed: %v", fErr)
+					n.logf("[node] UpdateTool force-kill also failed: %v", fErr)
 				}
 			}
 		case <-time.After(15 * time.Second):
-			log.Printf("[node] UpdateTool stop timed out after 15s — force-killing %s", toolName)
+			n.logf("[node] UpdateTool stop timed out after 15s — force-killing %s", toolName)
 			if fErr := n.executor.ForceKill(toolName); fErr != nil {
-				log.Printf("[node] UpdateTool force-kill error: %v", fErr)
+				n.logf("[node] UpdateTool force-kill error: %v", fErr)
 			}
 		}
 		if n.eventBus != nil {
@@ -957,11 +1063,11 @@ func (n *Node) UpdateTool(toolName string, clean bool) (string, string, error) {
 	}
 
 	// Unregister old version from mesh
-	log.Printf("[node] UpdateTool unregistering %s from mesh", toolName)
+	n.logf("[node] UpdateTool unregistering %s from mesh", toolName)
 	n.mesh.UnregisterTool(toolName)
 
 	// Update the tool
-	log.Printf("[node] UpdateTool reloading manifest/packages for %s", toolName)
+	n.logf("[node] UpdateTool reloading manifest/packages for %s", toolName)
 	updatedTool, err := n.manager.Update(toolName, clean)
 	if err != nil {
 		logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{Level: "error", Kind: "tool", Tool: toolName, Duration: time.Since(started), OK: logstore.BoolPtr(false), Message: "tool update failed", Data: map[string]any{"from_version": oldVersion, "clean": clean, "error": err.Error()}})
@@ -969,19 +1075,19 @@ func (n *Node) UpdateTool(toolName string, clean bool) (string, string, error) {
 	}
 
 	// Re-register with new version
-	log.Printf("[node] UpdateTool re-registering %s version=%s", toolName, updatedTool.Manifest.Version)
+	n.logf("[node] UpdateTool re-registering %s version=%s", toolName, updatedTool.Manifest.Version)
 	if err := n.registerTool(updatedTool); err != nil {
 		logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{Level: "error", Kind: "tool", Tool: toolName, Duration: time.Since(started), OK: logstore.BoolPtr(false), Message: "tool update failed", Data: map[string]any{"from_version": oldVersion, "to_version": updatedTool.Manifest.Version, "error": err.Error()}})
 		return oldVersion, updatedTool.Manifest.Version, fmt.Errorf("updated but failed to re-register: %w", err)
 	}
 
-	log.Printf("[node] updated %s: v%s → v%s", toolName, oldVersion, updatedTool.Manifest.Version)
+	n.logf("[node] updated %s: v%s → v%s", toolName, oldVersion, updatedTool.Manifest.Version)
 	logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{Level: "info", Kind: "tool", Tool: toolName, Duration: time.Since(started), OK: logstore.BoolPtr(true), Message: "tool updated", Data: map[string]any{"from_version": oldVersion, "to_version": updatedTool.Manifest.Version, "clean": clean}})
 
 	// Emit tool.installed event (with new version — update is effectively reinstall)
 	if n.eventBus != nil {
 		if err := n.eventBus.Emit(events.ToolInstalled(n.nodeName, toolName, updatedTool.Manifest.Version)); err != nil {
-			log.Printf("[node] warning: failed to emit tool.installed (update): %v", err)
+			n.logf("[node] warning: failed to emit tool.installed (update): %v", err)
 		}
 	}
 
@@ -1013,13 +1119,13 @@ func (n *Node) UninstallTool(toolName string, removeEnv bool) error {
 		return err
 	}
 
-	log.Printf("[node] uninstalled %s", toolName)
+	n.logf("[node] uninstalled %s", toolName)
 	logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{Level: "info", Kind: "tool", Tool: toolName, Duration: time.Since(started), OK: logstore.BoolPtr(true), Message: "tool uninstalled", Data: map[string]any{"remove_env": removeEnv}})
 
 	// Emit tool.removed event
 	if n.eventBus != nil {
 		if err := n.eventBus.Emit(events.ToolRemoved(n.nodeName, toolName)); err != nil {
-			log.Printf("[node] warning: failed to emit tool.removed: %v", err)
+			n.logf("[node] warning: failed to emit tool.removed: %v", err)
 		}
 	}
 
@@ -1182,11 +1288,11 @@ func (n *Node) onPeerFound(peer discovery.Peer) {
 	n.mu.Unlock()
 
 	if n.shouldDemote(peer) {
-		log.Printf("[node] split-brain detected: found older seed %s (started=%d, ours=%d). Demoting to leaf.",
+		n.logf("[node] split-brain detected: found older seed %s (started=%d, ours=%d). Demoting to leaf.",
 			peer.Name, peer.StartedAt, n.startedAt)
 		go n.demoteToLeaf(peer) // run async to not block browse loop
 	} else {
-		log.Printf("[node] split-brain detected: we are the older seed (started=%d, %s=%d). Keeping seed role.",
+		n.logf("[node] split-brain detected: we are the older seed (started=%d, %s=%d). Keeping seed role.",
 			n.startedAt, peer.Name, peer.StartedAt)
 	}
 }
@@ -1211,7 +1317,7 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 
 	leafURL := seed.LeafURL()
 	seedClientURL := seed.ClientURL()
-	log.Printf("[node] demoting to leaf: disconnecting from current NATS...")
+	n.logf("[node] demoting to leaf: disconnecting from current NATS...")
 
 	// 1. Close mesh client (unsubscribes all handlers)
 	if n.mesh != nil {
@@ -1235,15 +1341,16 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 		NodeName:    n.nodeName,
 		Role:        "leaf",
 		LeafRemotes: []string{leafURL},
+		Logging:     n.logging,
 	}
 	ns, err := startEmbeddedNATS(embeddedCfg)
 	if err != nil {
-		log.Printf("[node] FATAL: failed to restart NATS as leaf: %v", err)
-		log.Printf("[node] node is in a broken state — manual restart required")
+		n.logf("[node] FATAL: failed to restart NATS as leaf: %v", err)
+		n.logf("[node] node is in a broken state — manual restart required")
 		return
 	}
 	n.natsServer = ns
-	log.Printf("[node] NATS restarted as leaf, connecting to seed %s", leafURL)
+	n.logf("[node] NATS restarted as leaf, connecting to seed %s", leafURL)
 
 	// 4. Reconnect mesh client to the active seed client URL so leaf-published
 	// structured logs/events flow onto the shared mesh instead of staying local-only.
@@ -1251,15 +1358,22 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 		NATSUrl:  seedClientURL,
 		NodeName: n.nodeName,
 		Token:    n.token,
+		Logging: mesh.LoggingConfig{
+			Quiet:  n.logging.Quiet,
+			Logger: n.logging.Logger,
+		},
 	})
 	if err != nil {
-		log.Printf("[node] FATAL: failed to reconnect mesh: %v", err)
+		n.logf("[node] FATAL: failed to reconnect mesh: %v", err)
 		return
 	}
 	n.mesh = m
 
 	// Re-init event bus on new connection
-	n.eventBus = events.NewBus(m.Conn(), n.nodeName)
+	n.eventBus = events.NewBusWithLogging(m.Conn(), n.nodeName, events.LoggingConfig{
+		Quiet:  n.logging.Quiet,
+		Logger: n.logging.Logger,
+	})
 
 	// Inject the active seed client URL into executor so tool-side producers publish onto
 	// the shared mesh/logstore rather than the local embedded leaf listener.
@@ -1268,7 +1382,7 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 	// 5. Re-register all tools
 	for _, tool := range n.manager.List() {
 		if err := n.registerTool(tool); err != nil {
-			log.Printf("[node] warning: failed to re-register %s after demotion: %v", tool.Name, err)
+			n.logf("[node] warning: failed to re-register %s after demotion: %v", tool.Name, err)
 		}
 	}
 
@@ -1324,14 +1438,14 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 		})
 		if err == nil {
 			if err := disc.Start(); err != nil {
-				log.Printf("[node] warning: failed to restart mDNS as leaf: %v", err)
+				n.logf("[node] warning: failed to restart mDNS as leaf: %v", err)
 			} else {
 				n.discovery = disc
 			}
 		}
 	}
 
-	log.Printf("[node] demotion complete: now running as leaf node connected to seed %s", seed.Name)
+	n.logf("[node] demotion complete: now running as leaf node connected to seed %s", seed.Name)
 	n.logProducer = logstore.NewProducer(n.mesh.Conn(), n.nodeName)
 	logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{Level: "info", Kind: "node", Message: "node connected", Data: map[string]any{"role": "leaf", "seed": seed.Name}})
 }
@@ -1342,7 +1456,7 @@ func (n *Node) Close() {
 	if n.eventBus != nil && n.mesh != nil {
 		logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{Level: "info", Kind: "node", Message: "node shutting down", Data: map[string]any{"reason": "shutdown"}})
 		if err := n.eventBus.Emit(events.NodeLeft(n.nodeName, "shutdown")); err != nil {
-			log.Printf("[node] warning: failed to emit node.left: %v", err)
+			n.logf("[node] warning: failed to emit node.left: %v", err)
 		}
 		// Flush to ensure event is published before closing
 		n.mesh.Conn().Flush()
@@ -1382,7 +1496,7 @@ func (n *Node) startLoggingService() error {
 	if cfg.MaxQueryWindow != "" {
 		parsed, err := time.ParseDuration(cfg.MaxQueryWindow)
 		if err != nil {
-			log.Printf("[node] warning: invalid logging_service.max_query_window %q: %v", cfg.MaxQueryWindow, err)
+			n.logf("[node] warning: invalid logging_service.max_query_window %q: %v", cfg.MaxQueryWindow, err)
 		} else {
 			maxQueryWindow = parsed
 		}
@@ -1425,11 +1539,11 @@ func (n *Node) startLoggingService() error {
 
 	js, err := n.mesh.Conn().JetStream()
 	if err != nil {
-		log.Printf("[node] warning: failed to create logstore state store: %v", err)
+		n.logf("[node] warning: failed to create logstore state store: %v", err)
 	} else {
 		stateStore, err := state.NewStore(js)
 		if err != nil {
-			log.Printf("[node] warning: failed to initialize node health store for logstore: %v", err)
+			n.logf("[node] warning: failed to initialize node health store for logstore: %v", err)
 		} else {
 			n.logStateStore = stateStore
 			n.publishLogstoreHealth()
@@ -1467,7 +1581,7 @@ func (n *Node) publishLogstoreHealth() {
 		ToolCount:    len(n.manager.List()),
 		RunningTools: extraTools,
 	}); err != nil {
-		log.Printf("[node] warning: failed to publish logstore health state: %v", err)
+		n.logf("[node] warning: failed to publish logstore health state: %v", err)
 	}
 }
 

@@ -127,7 +127,7 @@ func (m *Mesh) SubscribeFileHandlers(store *filestore.Store) error {
 		return fmt.Errorf("subscribe files.list: %w", err)
 	}
 
-	log.Printf("[mesh] file store handlers registered (5 subjects)")
+	m.logf("[mesh] file store handlers registered (5 subjects)")
 	return nil
 }
 
