@@ -73,6 +73,8 @@ func TestSaveAndLoad(t *testing.T) {
 	cfg := DefaultConfigWithHome(dir)
 	cfg.APIPort = 1234
 	cfg.AuthToken = "test-token"
+	cfg.NATS.EmbedHost = "127.0.0.1"
+	cfg.NATS.LeafHost = "127.0.0.1"
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save failed: %v", err)
 	}
@@ -86,6 +88,9 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if loaded.AuthToken != "test-token" {
 		t.Fatalf("expected AuthToken test-token, got %s", loaded.AuthToken)
+	}
+	if loaded.NATS.EmbedHost != "127.0.0.1" || loaded.NATS.LeafHost != "127.0.0.1" {
+		t.Fatalf("expected NATS bind hosts to round-trip, got embed=%q leaf=%q", loaded.NATS.EmbedHost, loaded.NATS.LeafHost)
 	}
 }
 

@@ -83,7 +83,9 @@ A full edge-proxy smoke should verify:
 ## Security notes
 
 - Keep WebSocket disabled by default.
-- Prefer binding the embedded listener to `127.0.0.1` or a private interface.
+- Prefer binding embedded listeners to `127.0.0.1` or a private interface
+  (`jb-mesh serve --embed-host 127.0.0.1 --leaf-host 127.0.0.1` for a
+  local-only seed).
 - Do not expose raw NATS client, leaf, or WebSocket ports publicly.
 - Use a reverse proxy for TLS, authentication, rate limiting, and logging.
 - Prefer `Authorization: Bearer ...` for WebSocket auth when the client can set headers; fall back to query parameters only when necessary.

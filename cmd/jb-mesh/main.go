@@ -31,7 +31,9 @@ var (
 	flagNoMDNS          bool
 	flagSeed            bool
 	flagLeaf            string
+	flagEmbedHost       string
 	flagLeafPort        int
+	flagLeafHost        string
 	flagWebsocketHost   string
 	flagWebsocketPort   int
 	flagNATSWSProxyPath string
@@ -201,8 +203,10 @@ func serveCmd() *cobra.Command {
 				NATSWebSocket: wsCfg,
 				HomeDir:       flagHome,
 				NoMDNS:        flagNoMDNS,
+				EmbedHost:     flagEmbedHost,
 				WebsocketHost: flagWebsocketHost,
 				WebsocketPort: flagWebsocketPort,
+				LeafHost:      flagLeafHost,
 				LeafPort:      flagLeafPort,
 			}
 
@@ -249,7 +253,9 @@ func serveCmd() *cobra.Command {
 
 	cmd.Flags().BoolVar(&flagSeed, "seed", false, "Force seed role (skip mDNS browse)")
 	cmd.Flags().StringVar(&flagLeaf, "leaf", "", "Force leaf role, connect to seed at this URL (nats-leaf://host:port)")
+	cmd.Flags().StringVar(&flagEmbedHost, "embed-host", "", "Embedded NATS client bind host (empty uses default 0.0.0.0)")
 	cmd.Flags().IntVar(&flagLeafPort, "leaf-port", 0, "Embedded NATS leaf-node bind port for seed role (0 uses default 7422)")
+	cmd.Flags().StringVar(&flagLeafHost, "leaf-host", "", "Embedded NATS leaf-node bind host for seed role (empty uses default 0.0.0.0)")
 	cmd.Flags().BoolVar(&flagNoMDNS, "no-mdns", false, "Disable mDNS peer discovery (for Docker/cloud)")
 	cmd.Flags().StringVar(&flagWebsocketHost, "websocket-host", "127.0.0.1", "Embedded NATS websocket bind host (private; Portal should terminate public TLS)")
 	cmd.Flags().IntVar(&flagWebsocketPort, "websocket-port", 0, "Embedded NATS websocket bind port (0 disables websocket)")

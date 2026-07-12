@@ -62,6 +62,68 @@ func TestNewQuietEmbeddedNodeSuppressesLifecycleLogs(t *testing.T) {
 	}
 }
 
+func TestEmbeddedNATSBindHost(t *testing.T) {
+	server, err := startEmbeddedNATS(embeddedNATSConfig{
+		StoreDir: filepath.Join(t.TempDir(), "js"),
+		Host:     "127.0.0.1",
+		Port:     -1,
+		NodeName: "loopback-node",
+		Role:     "seed",
+		LeafPort: -1,
+		Logging:  LoggingConfig{Quiet: true},
+	})
+	if err != nil {
+		t.Fatalf("start embedded NATS: %v", err)
+	}
+	t.Cleanup(server.Shutdown)
+
+	addr, ok := server.Addr().(*net.TCPAddr)
+	if !ok || addr == nil {
+		t.Fatalf("server addr = %T %v, want TCP addr", server.Addr(), server.Addr())
+	}
+	if got := addr.IP.String(); got != "127.0.0.1" {
+		t.Fatalf("server bind host = %q, want 127.0.0.1", got)
+	}
+
+	nc, err := nats.Connect(server.ClientURL(), nats.MaxReconnects(0))
+	if err != nil {
+		t.Fatalf("connect to loopback embedded NATS: %v", err)
+	}
+	nc.Close()
+}
+
+func TestNewUsesConfiguredEmbeddedBindHosts(t *testing.T) {
+	home := t.TempDir()
+	cfg := cfgpkg.DefaultConfigWithHome(home)
+	cfg.NATS.EmbedHost = "127.0.0.1"
+	cfg.NATS.LeafHost = "127.0.0.1"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	n, err := New(Config{
+		NodeName:  "configured-loopback-node",
+		HomeDir:   home,
+		NoMDNS:    true,
+		Role:      "seed",
+		EmbedPort: -1,
+		LeafPort:  -1,
+		Logging:   LoggingConfig{Quiet: true},
+	})
+	if err != nil {
+		t.Fatalf("New configured node: %v", err)
+	}
+	t.Cleanup(n.Close)
+
+	addr, ok := n.natsServer.Addr().(*net.TCPAddr)
+	if !ok || addr == nil {
+		t.Fatalf("server addr = %T %v, want TCP addr", n.natsServer.Addr(), n.natsServer.Addr())
+	}
+	if got := addr.IP.String(); got != "127.0.0.1" {
+		t.Fatalf("configured server bind host = %q, want 127.0.0.1", got)
+	}
+}
+
 func TestSlogNATSLoggerRoutesMessages(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))

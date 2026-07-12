@@ -77,6 +77,14 @@ type NATSConfig struct {
 	// EmbedPort is the port for the embedded NATS server. Default: 4222.
 	EmbedPort int `yaml:"embed_port,omitempty"`
 
+	// EmbedHost is the bind host for the embedded NATS client listener.
+	// Empty preserves the node package default.
+	EmbedHost string `yaml:"embed_host,omitempty"`
+
+	// LeafHost is the bind host for the embedded NATS leaf-node listener.
+	// Empty preserves the node package default.
+	LeafHost string `yaml:"leaf_host,omitempty"`
+
 	// JetStream controls whether JetStream is enabled. Default: true.
 	// Set to false only for resource-constrained edge nodes.
 	JetStream *bool `yaml:"jetstream,omitempty"`

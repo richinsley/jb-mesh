@@ -71,7 +71,13 @@ jb-mesh serve --leaf nats-leaf://node-a.local:7422 --name node-b
 
 With mDNS enabled, nodes can also discover a seed automatically on networks where Bonjour/Avahi works.
 
-For public or cross-network deployments, put NATS behind a properly authenticated transport and read [`docs/nats-websocket.md`](docs/nats-websocket.md).
+Embedded NATS client and leaf listeners default to all interfaces so LAN peers can join a seed. For a local-only node, bind both listeners to loopback:
+
+```bash
+jb-mesh serve --seed --no-mdns --embed-host 127.0.0.1 --leaf-host 127.0.0.1
+```
+
+For public, cross-network, or untrusted-LAN deployments, use a NATS token and put NATS behind a properly authenticated transport; read [`docs/nats-websocket.md`](docs/nats-websocket.md).
 
 ## Writing a tool
 

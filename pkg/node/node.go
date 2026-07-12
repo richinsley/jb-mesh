@@ -51,7 +51,9 @@ type Node struct {
 	startedAt        int64      // unix seconds, for split-brain tiebreaker
 	token            string     // saved for demotion reconnect
 	natsPort         int        // saved for demotion reconnect
+	natsHost         string     // saved for demotion reconnect
 	leafPort         int        // saved for demotion reconnect
+	leafHost         string     // saved for demotion reconnect
 	mu               sync.Mutex // protects role transitions (demotion)
 
 	// Per-tool raw streaming subscriptions (`.stream` subjects). These are
@@ -72,6 +74,8 @@ type Config struct {
 	Role          string // "seed", "leaf", or "" (auto-detect via mDNS)
 	LeafURL       string // explicit leaf connection URL (--leaf flag)
 	LeafPort      int    // embedded NATS leaf-node bind port for seed role
+	EmbedHost     string // embedded NATS client bind host; empty preserves jb-mesh default (0.0.0.0)
+	LeafHost      string // embedded NATS leaf-node bind host for seed role; empty preserves jb-mesh default (0.0.0.0)
 	WebsocketHost string // embedded NATS websocket bind host; empty disables websocket
 	WebsocketPort int    // embedded NATS websocket bind port
 	Logging       LoggingConfig
@@ -194,9 +198,17 @@ func New(cfg Config) (*Node, error) {
 	if cfg.EmbedPort != 0 {
 		natsPort = cfg.EmbedPort
 	}
+	natsHost := strings.TrimSpace(jbCfg.NATS.EmbedHost)
+	if strings.TrimSpace(cfg.EmbedHost) != "" {
+		natsHost = strings.TrimSpace(cfg.EmbedHost)
+	}
 	leafPort := cfg.LeafPort
 	if leafPort == 0 {
 		leafPort = DefaultLeafPort
+	}
+	leafHost := strings.TrimSpace(jbCfg.NATS.LeafHost)
+	if strings.TrimSpace(cfg.LeafHost) != "" {
+		leafHost = strings.TrimSpace(cfg.LeafHost)
 	}
 	startedAt := time.Now().Unix()
 
@@ -253,9 +265,11 @@ func New(cfg Config) (*Node, error) {
 		embeddedCfg := embeddedNATSConfig{
 			Token:         cfg.Token,
 			StoreDir:      jbCfg.JetStreamDir(),
+			Host:          natsHost,
 			Port:          natsPort,
 			NodeName:      cfg.NodeName,
 			Role:          role,
+			LeafHost:      leafHost,
 			LeafPort:      leafPort,
 			LeafRemotes:   leafRemotes,
 			WebsocketHost: cfg.WebsocketHost,
@@ -276,7 +290,9 @@ func New(cfg Config) (*Node, error) {
 		} else {
 			n.natsPort = natsPort
 		}
+		n.natsHost = natsHost
 		n.leafPort = leafPort
+		n.leafHost = leafHost
 		cfg.NATSUrl = ns.ClientURL()
 		n.logf("[node] embedded NATS server running at %s (role=%s)", cfg.NATSUrl, role)
 
@@ -478,7 +494,8 @@ const (
 type embeddedNATSConfig struct {
 	Token         string
 	StoreDir      string
-	Port          int // client port (default 4222)
+	Host          string // client bind host; empty preserves historical 0.0.0.0
+	Port          int    // client port (default 4222)
 	NodeName      string
 	Role          string // "seed" or "leaf"
 	WebsocketHost string // optional websocket bind host
@@ -486,6 +503,7 @@ type embeddedNATSConfig struct {
 	Logging       LoggingConfig
 
 	// Seed-only: port for incoming leaf node connections (default 7422)
+	LeafHost string // empty preserves historical 0.0.0.0
 	LeafPort int
 
 	// Leaf-only: seed URLs to connect to (nats-leaf://host:port)
@@ -506,10 +524,14 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 	if port == 0 {
 		port = DefaultNATSPort
 	}
+	host := cfg.Host
+	if host == "" {
+		host = "0.0.0.0"
+	}
 	logCfg := newNodeLog(cfg.Logging)
 
 	opts := &natsserver.Options{
-		Host:           "0.0.0.0",
+		Host:           host,
 		Port:           port,
 		ServerName:     cfg.NodeName,
 		NoLog:          cfg.Logging.Quiet && cfg.Logging.Logger == nil && cfg.Logging.NATSLogger == nil,
@@ -542,11 +564,15 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 		if leafPort == 0 {
 			leafPort = DefaultLeafPort
 		}
+		leafHost := cfg.LeafHost
+		if leafHost == "" {
+			leafHost = "0.0.0.0"
+		}
 		opts.LeafNode = natsserver.LeafNodeOpts{
-			Host: "0.0.0.0",
+			Host: leafHost,
 			Port: leafPort,
 		}
-		logCfg.printf("[node] NATS seed: clients on :%d, leaf connections on :%d", port, leafPort)
+		logCfg.printf("[node] NATS seed: clients on %s:%d, leaf connections on %s:%d", host, port, leafHost, leafPort)
 
 	case "leaf":
 		var remotes []*natsserver.RemoteLeafOpts
@@ -566,7 +592,7 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 		opts.LeafNode = natsserver.LeafNodeOpts{
 			Remotes: remotes,
 		}
-		logCfg.printf("[node] NATS leaf: clients on :%d, connecting to seed(s): %v", port, cfg.LeafRemotes)
+		logCfg.printf("[node] NATS leaf: clients on %s:%d, connecting to seed(s): %v", host, port, cfg.LeafRemotes)
 
 	default:
 		return nil, fmt.Errorf("unknown NATS role: %q (expected \"seed\" or \"leaf\")", cfg.Role)
@@ -1337,6 +1363,7 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 	embeddedCfg := embeddedNATSConfig{
 		Token:       n.token,
 		StoreDir:    n.cfg.JetStreamDir(),
+		Host:        n.natsHost,
 		Port:        n.natsPort,
 		NodeName:    n.nodeName,
 		Role:        "leaf",
