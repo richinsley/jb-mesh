@@ -75,6 +75,15 @@ func prepareConnectOptions(cfg Config, extraOpts ...nats.Option) ([]nats.Option,
 	if cfg.Token != "" {
 		opts = append(opts, nats.Token(cfg.Token))
 	}
+	if cfg.Username != "" || cfg.Password != "" {
+		if cfg.Username == "" || cfg.Password == "" {
+			return nil, fmt.Errorf("NATS username/password auth requires both username and password")
+		}
+		if cfg.Token != "" {
+			return nil, fmt.Errorf("NATS token auth cannot be combined with username/password auth")
+		}
+		opts = append(opts, nats.UserInfo(cfg.Username, cfg.Password))
+	}
 
 	wsHeaders := cloneHeader(cfg.WebSocket.Headers)
 	if cfg.WebSocket.BearerToken != "" {

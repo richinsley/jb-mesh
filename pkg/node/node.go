@@ -6,6 +6,8 @@ package node
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -68,6 +70,7 @@ type Config struct {
 	NATSUrl       string // explicit NATS URL (skips embed + mDNS)
 	NodeName      string
 	Token         string
+	Authorization Authorization
 	NATSWebSocket mesh.NATSWebSocketConfig
 	HomeDir       string
 	NoMDNS        bool   // disable mDNS discovery
@@ -85,6 +88,129 @@ type Config struct {
 	// (4222). Pass -1 to bind a random free port — useful for parallel
 	// tests or running multiple in-process nodes on one host.
 	EmbedPort int
+}
+
+// Authorization is the narrow typed authorization seam for embedded NATS seeds.
+// It is deliberately NOT a raw NATS config escape hatch: callers provide named
+// principals with credential material and allowed subject subtrees; node translates
+// that into NATS users/permissions. When Enabled is true, the embedded seed refuses
+// global token auth and denies every external principal not listed here.
+type Authorization struct {
+	Enabled    bool
+	Principals []AuthorizedPrincipal
+
+	// InternalUsername/InternalPassword are optional process-local credentials for
+	// this node's own jb-mesh client connection to its embedded server. If either
+	// is empty, node.New generates both in memory. They are never logged.
+	InternalUsername string
+	InternalPassword string
+}
+
+// AuthorizedPrincipal is one external principal admitted by typed authorization.
+// Password is the secret credential material for NATS user/pass auth; subject
+// strings are NATS subtree permissions such as "poppi.mesh.host.op.alice.>".
+type AuthorizedPrincipal struct {
+	PrincipalID    string
+	Password       string
+	PublishAllow   []string
+	SubscribeAllow []string
+}
+
+func prepareAuthorization(in Authorization) (Authorization, error) {
+	if !in.Enabled {
+		return Authorization{}, nil
+	}
+	out := in
+	if strings.TrimSpace(out.InternalUsername) == "" || strings.TrimSpace(out.InternalPassword) == "" {
+		user, pass, err := generateInternalAuth()
+		if err != nil {
+			return Authorization{}, err
+		}
+		out.InternalUsername = user
+		out.InternalPassword = pass
+	}
+	seen := map[string]bool{}
+	for i := range out.Principals {
+		p := &out.Principals[i]
+		p.PrincipalID = strings.TrimSpace(p.PrincipalID)
+		p.Password = strings.TrimSpace(p.Password)
+		if p.PrincipalID == "" {
+			return Authorization{}, fmt.Errorf("typed NATS authorization principal %d has no principal id", i)
+		}
+		if p.PrincipalID == out.InternalUsername {
+			return Authorization{}, fmt.Errorf("typed NATS authorization principal %q conflicts with the internal user", p.PrincipalID)
+		}
+		if seen[p.PrincipalID] {
+			return Authorization{}, fmt.Errorf("typed NATS authorization declares principal %q more than once", p.PrincipalID)
+		}
+		seen[p.PrincipalID] = true
+		if p.Password == "" {
+			return Authorization{}, fmt.Errorf("typed NATS authorization principal %q has no credential material", p.PrincipalID)
+		}
+		var err error
+		p.PublishAllow, err = validateSubjectSubtrees("publish", p.PrincipalID, p.PublishAllow)
+		if err != nil {
+			return Authorization{}, err
+		}
+		p.SubscribeAllow, err = validateSubjectSubtrees("subscribe", p.PrincipalID, p.SubscribeAllow)
+		if err != nil {
+			return Authorization{}, err
+		}
+	}
+	return out, nil
+}
+
+func generateInternalAuth() (string, string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("typed NATS authorization could not generate internal credential: %w", err)
+	}
+	pass := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(raw), "="))
+	return "_jbmesh_internal", pass, nil
+}
+
+func validateSubjectSubtrees(kind, principal string, in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, subj := range in {
+		subj = strings.TrimSpace(subj)
+		if err := validateSubjectSubtree(subj); err != nil {
+			return nil, fmt.Errorf("typed NATS authorization principal %q has invalid %s subject %q: %w", principal, kind, subj, err)
+		}
+		if !seen[subj] {
+			out = append(out, subj)
+			seen[subj] = true
+		}
+	}
+	return out, nil
+}
+
+func validateSubjectSubtree(subj string) error {
+	if subj == "" {
+		return fmt.Errorf("blank subject")
+	}
+	if subj == ">" {
+		return fmt.Errorf("external principals cannot be granted the all-subject wildcard")
+	}
+	if strings.ContainsAny(subj, " \t\r\n") {
+		return fmt.Errorf("subjects cannot contain whitespace")
+	}
+	parts := strings.Split(subj, ".")
+	for i, part := range parts {
+		switch {
+		case part == "":
+			return fmt.Errorf("subjects cannot contain empty tokens")
+		case part == "*":
+			return fmt.Errorf("single-token wildcard is not a subtree grant")
+		case part == ">":
+			if i != len(parts)-1 {
+				return fmt.Errorf("full wildcard must be the final token")
+			}
+		case strings.Contains(part, ">") || strings.Contains(part, "*"):
+			return fmt.Errorf("wildcards must be whole tokens")
+		}
+	}
+	return nil
 }
 
 // LoggingConfig controls human-readable node and embedded-NATS lifecycle logs.
@@ -173,6 +299,21 @@ func (l slogNATSLogger) log(level slog.Level, format string, args ...any) {
 
 // New creates and starts a new node
 func New(cfg Config) (*Node, error) {
+	if cfg.Authorization.Enabled && cfg.Token != "" {
+		return nil, fmt.Errorf("typed NATS authorization cannot be combined with global token auth")
+	}
+	if cfg.Authorization.Enabled && strings.TrimSpace(cfg.NATSUrl) != "" {
+		return nil, fmt.Errorf("typed NATS authorization applies only to embedded NATS seeds; external NATS URLs must provide their own prepared-zone ACL")
+	}
+	authz := cfg.Authorization
+	if authz.Enabled {
+		var err error
+		authz, err = prepareAuthorization(authz)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Load jb-mesh config
 	jbCfg, err := config.LoadWithHome(cfg.HomeDir)
 	if err != nil {
@@ -264,6 +405,7 @@ func New(cfg Config) (*Node, error) {
 		// Start embedded NATS with determined role
 		embeddedCfg := embeddedNATSConfig{
 			Token:         cfg.Token,
+			Authorization: authz,
 			StoreDir:      jbCfg.JetStreamDir(),
 			Host:          natsHost,
 			Port:          natsPort,
@@ -340,6 +482,8 @@ func New(cfg Config) (*Node, error) {
 		NATSUrl:   cfg.NATSUrl,
 		NodeName:  cfg.NodeName,
 		Token:     cfg.Token,
+		Username:  authz.InternalUsername,
+		Password:  authz.InternalPassword,
 		WebSocket: cfg.NATSWebSocket,
 		Logging: mesh.LoggingConfig{
 			Quiet:  cfg.Logging.Quiet,
@@ -493,6 +637,7 @@ const (
 
 type embeddedNATSConfig struct {
 	Token         string
+	Authorization Authorization
 	StoreDir      string
 	Host          string // client bind host; empty preserves historical 0.0.0.0
 	Port          int    // client port (default 4222)
@@ -543,6 +688,27 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 
 	if cfg.Token != "" {
 		opts.Authorization = cfg.Token
+	}
+	if cfg.Authorization.Enabled {
+		users := []*natsserver.User{{
+			Username: cfg.Authorization.InternalUsername,
+			Password: cfg.Authorization.InternalPassword,
+			Permissions: &natsserver.Permissions{
+				Publish:   &natsserver.SubjectPermission{Allow: []string{">"}},
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{">"}},
+			},
+		}}
+		for _, p := range cfg.Authorization.Principals {
+			users = append(users, &natsserver.User{
+				Username: p.PrincipalID,
+				Password: p.Password,
+				Permissions: &natsserver.Permissions{
+					Publish:   &natsserver.SubjectPermission{Allow: append([]string(nil), p.PublishAllow...)},
+					Subscribe: &natsserver.SubjectPermission{Allow: append([]string(nil), p.SubscribeAllow...)},
+				},
+			})
+		}
+		opts.Users = users
 	}
 
 	if cfg.WebsocketPort != 0 {

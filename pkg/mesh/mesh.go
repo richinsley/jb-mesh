@@ -78,6 +78,8 @@ type Config struct {
 	NATSUrl   string              // NATS server URL (default: nats://localhost:4222)
 	NodeName  string              // Human-readable node name
 	Token     string              // Optional auth token
+	Username  string              // Optional username for typed embedded authorization
+	Password  string              // Optional password for typed embedded authorization
 	WebSocket NATSWebSocketConfig // Optional WebSocket client settings for ws:// or wss:// URLs
 	Logging   LoggingConfig       // Optional lifecycle logging policy
 }
