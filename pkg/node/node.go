@@ -72,6 +72,8 @@ type Config struct {
 	NATSUrl       string // explicit NATS URL (skips embed + mDNS)
 	NodeName      string
 	Token         string
+	Username      string
+	Password      string
 	Authorization Authorization
 	NATSWebSocket mesh.NATSWebSocketConfig
 	HomeDir       string
@@ -304,6 +306,14 @@ func New(cfg Config) (*Node, error) {
 	if cfg.Authorization.Enabled && cfg.Token != "" {
 		return nil, fmt.Errorf("typed NATS authorization cannot be combined with global token auth")
 	}
+	if cfg.Token != "" && (strings.TrimSpace(cfg.Username) != "" || strings.TrimSpace(cfg.Password) != "") {
+		return nil, fmt.Errorf("NATS token auth cannot be combined with username/password auth")
+	}
+	if strings.TrimSpace(cfg.Username) != "" || strings.TrimSpace(cfg.Password) != "" {
+		if strings.TrimSpace(cfg.Username) == "" || strings.TrimSpace(cfg.Password) == "" {
+			return nil, fmt.Errorf("NATS username/password auth requires both username and password")
+		}
+	}
 	if cfg.Authorization.Enabled && strings.TrimSpace(cfg.NATSUrl) != "" {
 		return nil, fmt.Errorf("typed NATS authorization applies only to embedded NATS seeds; external NATS URLs must provide their own prepared-zone ACL")
 	}
@@ -490,8 +500,8 @@ func New(cfg Config) (*Node, error) {
 		NATSUrl:   cfg.NATSUrl,
 		NodeName:  cfg.NodeName,
 		Token:     cfg.Token,
-		Username:  authz.InternalUsername,
-		Password:  authz.InternalPassword,
+		Username:  firstNonEmpty(cfg.Username, authz.InternalUsername),
+		Password:  firstNonEmpty(cfg.Password, authz.InternalPassword),
 		WebSocket: cfg.NATSWebSocket,
 		Logging: mesh.LoggingConfig{
 			Quiet:  cfg.Logging.Quiet,
@@ -635,6 +645,15 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	return n, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // embeddedNATSConfig holds configuration for starting an embedded NATS server.
