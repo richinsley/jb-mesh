@@ -145,6 +145,68 @@ func TestTypedAuthorizationEmptyAdmitsNoExternalPrincipal(t *testing.T) {
 	}
 }
 
+func TestReloadAuthorizationAddsAndRevokesPrincipalsWithoutStrandingSeed(t *testing.T) {
+	alice := AuthorizedPrincipal{
+		PrincipalID:    "alice",
+		Password:       "alice-secret",
+		PublishAllow:   []string{"tools.>"},
+		SubscribeAllow: []string{"tools.>"},
+	}
+	bob := AuthorizedPrincipal{
+		PrincipalID:    "bob",
+		Password:       "bob-secret",
+		PublishAllow:   []string{"tools.>"},
+		SubscribeAllow: []string{"tools.>"},
+	}
+	n, err := New(Config{
+		HomeDir:       t.TempDir(),
+		NodeName:      "auth-reload-seed",
+		Role:          "seed",
+		NoMDNS:        true,
+		EmbedHost:     "127.0.0.1",
+		EmbedPort:     -1,
+		LeafHost:      "127.0.0.1",
+		LeafPort:      -1,
+		Authorization: Authorization{Enabled: true, Principals: []AuthorizedPrincipal{alice}},
+		Logging:       LoggingConfig{Quiet: true},
+	})
+	if err != nil {
+		t.Fatalf("start typed seed: %v", err)
+	}
+	t.Cleanup(n.Close)
+	url := n.Mesh().Conn().ConnectedUrl()
+	aliceConn, err := connectUser(t, url, alice.PrincipalID, alice.Password, nil)
+	if err != nil {
+		t.Fatalf("alice initial connect: %v", err)
+	}
+	if _, err := connectUser(t, url, bob.PrincipalID, bob.Password, nil); err == nil {
+		t.Fatal("bob connected before authorization reload")
+	}
+
+	if err := n.ReloadAuthorization(Authorization{Enabled: true, Principals: []AuthorizedPrincipal{alice, bob}}); err != nil {
+		t.Fatalf("add bob: %v", err)
+	}
+	if _, err := connectUser(t, url, bob.PrincipalID, bob.Password, nil); err != nil {
+		t.Fatalf("bob connect after reload: %v", err)
+	}
+	if !n.Mesh().Conn().IsConnected() {
+		t.Fatal("seed internal mesh client was stranded by authorization reload")
+	}
+
+	if err := n.ReloadAuthorization(Authorization{Enabled: true, Principals: []AuthorizedPrincipal{bob}}); err != nil {
+		t.Fatalf("remove alice: %v", err)
+	}
+	if err := aliceConn.FlushTimeout(2 * time.Second); err == nil {
+		t.Fatal("removed alice connection remained authorized after reload")
+	}
+	if _, err := connectUser(t, url, alice.PrincipalID, alice.Password, nil); err == nil {
+		t.Fatal("removed alice reconnected after reload")
+	}
+	if !n.Mesh().Conn().IsConnected() {
+		t.Fatal("seed internal mesh client was disconnected by revocation reload")
+	}
+}
+
 func TestTypedAuthorizationValidation(t *testing.T) {
 	if _, err := New(Config{
 		HomeDir:       t.TempDir(),

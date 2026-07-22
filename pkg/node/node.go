@@ -47,6 +47,8 @@ type Node struct {
 	log              nodeLog
 	logging          LoggingConfig
 	natsServer       *natsserver.Server   // non-nil if embedded
+	natsOptions      *natsserver.Options  // startup options cloned for typed auth reload
+	authorization    Authorization        // prepared auth; preserves the internal client credential
 	discovery        *discovery.Discovery // non-nil if mDNS enabled
 	nodeName         string
 	role             string     // "seed" or "leaf" (empty if pure client mode)
@@ -423,6 +425,12 @@ func New(cfg Config) (*Node, error) {
 			return nil, fmt.Errorf("failed to start embedded NATS: %w", err)
 		}
 		n.natsServer = ns
+		n.natsOptions, err = embeddedNATSOptions(embeddedCfg)
+		if err != nil {
+			n.Close()
+			return nil, fmt.Errorf("failed to retain embedded NATS options: %w", err)
+		}
+		n.authorization = authz
 		n.role = role
 		n.startedAt = startedAt
 		n.token = cfg.Token
@@ -665,6 +673,14 @@ type embeddedNATSConfig struct {
 // between local clients and the seed. JetStream API requests from leaf clients
 // are forwarded to the seed.
 func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
+	opts, err := embeddedNATSOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return startEmbeddedNATSOptions(opts, cfg.Logging)
+}
+
+func embeddedNATSOptions(cfg embeddedNATSConfig) (*natsserver.Options, error) {
 	port := cfg.Port
 	if port == 0 {
 		port = DefaultNATSPort
@@ -690,25 +706,7 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 		opts.Authorization = cfg.Token
 	}
 	if cfg.Authorization.Enabled {
-		users := []*natsserver.User{{
-			Username: cfg.Authorization.InternalUsername,
-			Password: cfg.Authorization.InternalPassword,
-			Permissions: &natsserver.Permissions{
-				Publish:   &natsserver.SubjectPermission{Allow: []string{">"}},
-				Subscribe: &natsserver.SubjectPermission{Allow: []string{">"}},
-			},
-		}}
-		for _, p := range cfg.Authorization.Principals {
-			users = append(users, &natsserver.User{
-				Username: p.PrincipalID,
-				Password: p.Password,
-				Permissions: &natsserver.Permissions{
-					Publish:   &natsserver.SubjectPermission{Allow: append([]string(nil), p.PublishAllow...)},
-					Subscribe: &natsserver.SubjectPermission{Allow: append([]string(nil), p.SubscribeAllow...)},
-				},
-			})
-		}
-		opts.Users = users
+		opts.Users = authorizationUsers(cfg.Authorization)
 	}
 
 	if cfg.WebsocketPort != 0 {
@@ -763,16 +761,41 @@ func startEmbeddedNATS(cfg embeddedNATSConfig) (*natsserver.Server, error) {
 	default:
 		return nil, fmt.Errorf("unknown NATS role: %q (expected \"seed\" or \"leaf\")", cfg.Role)
 	}
+	return opts, nil
+}
 
+func authorizationUsers(authz Authorization) []*natsserver.User {
+	users := []*natsserver.User{{
+		Username: authz.InternalUsername,
+		Password: authz.InternalPassword,
+		Permissions: &natsserver.Permissions{
+			Publish:   &natsserver.SubjectPermission{Allow: []string{">"}},
+			Subscribe: &natsserver.SubjectPermission{Allow: []string{">"}},
+		},
+	}}
+	for _, p := range authz.Principals {
+		users = append(users, &natsserver.User{
+			Username: p.PrincipalID,
+			Password: p.Password,
+			Permissions: &natsserver.Permissions{
+				Publish:   &natsserver.SubjectPermission{Allow: append([]string(nil), p.PublishAllow...)},
+				Subscribe: &natsserver.SubjectPermission{Allow: append([]string(nil), p.SubscribeAllow...)},
+			},
+		})
+	}
+	return users
+}
+
+func startEmbeddedNATSOptions(opts *natsserver.Options, logging LoggingConfig) (*natsserver.Server, error) {
 	ns, err := natsserver.NewServer(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	if cfg.Logging.NATSLogger != nil {
-		ns.SetLogger(cfg.Logging.NATSLogger, cfg.Logging.NATSDebug, cfg.Logging.NATSTrace)
-	} else if cfg.Logging.Logger != nil {
-		ns.SetLogger(slogNATSLogger{logger: cfg.Logging.Logger}, cfg.Logging.NATSDebug, cfg.Logging.NATSTrace)
+	if logging.NATSLogger != nil {
+		ns.SetLogger(logging.NATSLogger, logging.NATSDebug, logging.NATSTrace)
+	} else if logging.Logger != nil {
+		ns.SetLogger(slogNATSLogger{logger: logging.Logger}, logging.NATSDebug, logging.NATSTrace)
 	} else {
 		ns.ConfigureLogger()
 	}
@@ -1351,6 +1374,40 @@ func (n *Node) ListMeshServices() ([]map[string]interface{}, error) {
 // ListLocalTools returns tools installed on this node
 func (n *Node) ListLocalTools() []*tools.Tool {
 	return n.manager.List()
+}
+
+// ReloadAuthorization replaces the typed external-principal authorization on a
+// running embedded seed. It preserves the process-local internal credentials so
+// this node's own mesh connection is never stranded. NATS applies the new user
+// set in-process: newly added principals may connect immediately, while removed
+// or newly unauthorized clients are disconnected by NATS during reload.
+func (n *Node) ReloadAuthorization(authz Authorization) error {
+	if !authz.Enabled {
+		return fmt.Errorf("typed NATS authorization reload requires enabled authorization")
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.natsServer == nil || n.natsOptions == nil || n.role != "seed" {
+		return fmt.Errorf("typed NATS authorization reload requires a running embedded seed")
+	}
+	if !n.authorization.Enabled {
+		return fmt.Errorf("typed NATS authorization reload cannot enable authorization on an untyped running seed")
+	}
+	authz.InternalUsername = n.authorization.InternalUsername
+	authz.InternalPassword = n.authorization.InternalPassword
+	prepared, err := prepareAuthorization(authz)
+	if err != nil {
+		return err
+	}
+	opts := n.natsOptions.Clone()
+	opts.Users = authorizationUsers(prepared)
+	retained := opts.Clone()
+	if err := n.natsServer.ReloadOptions(opts); err != nil {
+		return fmt.Errorf("reload typed NATS authorization: %w", err)
+	}
+	n.natsOptions = retained
+	n.authorization = prepared
+	return nil
 }
 
 // Mesh returns the underlying mesh connection
