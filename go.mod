@@ -7,7 +7,7 @@ require (
 	github.com/nats-io/nats-server/v2 v2.12.5
 	github.com/nats-io/nats.go v1.49.0
 	github.com/nats-io/nuid v1.0.1
-	github.com/richinsley/jumpboot v1.2.0
+	github.com/richinsley/jumpboot v1.2.2
 	github.com/spf13/cobra v1.8.0
 	gopkg.in/yaml.v3 v3.0.1
 )

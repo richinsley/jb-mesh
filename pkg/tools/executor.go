@@ -698,13 +698,32 @@ func (e *Executor) Close() {
 
 	// Close all queues
 	for name, queue := range e.queues {
-		queue.Close()
+		e.closeQueueWithFallback(name, queue)
 		if tool, ok := e.manager.Get(name); ok {
 			tool.Status = "stopped"
 			tool.HealthStatus = ""
 		}
 	}
 	e.queues = make(map[string]*jumpboot.QueueProcess)
+}
+
+func (e *Executor) closeQueueWithFallback(toolName string, queue *jumpboot.QueueProcess) {
+	done := make(chan error, 1)
+	go func() {
+		done <- queue.Close()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("[executor] Close queue for %s returned error: %v", toolName, err)
+		}
+	case <-time.After(5 * time.Second):
+		log.Printf("[executor] Close queue for %s timed out — force-killing", toolName)
+		if queue.PythonProcess != nil {
+			_ = queue.PythonProcess.Terminate()
+		}
+	}
 }
 
 // runHealthCheck runs periodic health checks for a tool
