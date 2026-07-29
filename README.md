@@ -219,10 +219,17 @@ Never commit local topology, hostnames, private paths, or credentials into servi
 
 Use `runtime.transport: msgpack` and `MessagePackService` when a service needs persistent state, streaming/progress behavior, or strict stdout isolation.
 
+## Service lifecycle
+
+`jb-mesh` performs managed cleanup for normal stop, `SIGINT` / `SIGTERM`, update, uninstall, and hung persistent-service shutdown paths. It does not claim in-process cleanup after raw `SIGKILL`, power loss, kernel crash, or an external supervisor killing only the parent process.
+
+See [`docs/service-lifecycle.md`](docs/service-lifecycle.md) for the exact lifecycle and hard-kill contract.
+
 ## Documentation
 
 - [`docs/authoring/service-starter.md`](docs/authoring/service-starter.md) — canonical service authoring path
 - [`docs/authoring/preflight.md`](docs/authoring/preflight.md) — what preflight checks and how it fits into tool development
+- [`docs/service-lifecycle.md`](docs/service-lifecycle.md) — service shutdown and hard-kill guarantees
 - [`sdk/python/`](sdk/python/) — visible Python SDK source and service-author documentation
 - [`docs/nats-websocket.md`](docs/nats-websocket.md) — WebSocket transport notes
 - [`examples/`](examples/) — minimal example services
