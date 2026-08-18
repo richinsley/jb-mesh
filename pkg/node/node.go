@@ -640,6 +640,9 @@ func New(cfg Config) (*Node, error) {
 			if err := m.SubscribeFileHandlers(store); err != nil {
 				n.logf("[node] warning: failed to register file store handlers: %v", err)
 			}
+			if err := m.RegisterFileTool(store); err != nil {
+				n.logf("[node] warning: failed to register file store tool: %v", err)
+			}
 			m.SetFileStore(store) // Enable file param resolution in tool calls
 		}
 	}
@@ -1445,6 +1448,10 @@ func (n *Node) Role() string {
 // This is used by SubscribeToolSchema to handle schema requests from other nodes
 // Prefers manifest-based schemas when available (no REPL spinup needed)
 func (n *Node) GetToolSchema(toolName string) (map[string]interface{}, error) {
+	if toolName == "files" {
+		return mesh.FileToolSchema(), nil
+	}
+
 	tool, ok := n.manager.Get(toolName)
 	if !ok {
 		return nil, fmt.Errorf("tool not found: %s", toolName)
@@ -1682,6 +1689,7 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 		store, err := filestore.NewStore(js, filestore.DefaultConfig())
 		if err == nil {
 			_ = m.SubscribeFileHandlers(store)
+			_ = m.RegisterFileTool(store)
 			m.SetFileStore(store) // Enable file param resolution in tool calls
 		}
 	}

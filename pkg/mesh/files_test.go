@@ -80,6 +80,42 @@ func setupFileHandlers(t *testing.T) (*nats.Conn, *filestore.Store) {
 	return nc, store
 }
 
+func setupFileTool(t *testing.T) (*nats.Conn, *mesh.Mesh) {
+	t.Helper()
+	ns, nc := startEmbeddedNATS(t)
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	store, err := filestore.NewStore(js, filestore.Config{
+		BucketName: "test-file-tool",
+		DefaultTTL: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("filestore: %v", err)
+	}
+
+	m, err := mesh.New(mesh.Config{
+		NATSUrl:  ns.ClientURL(),
+		NodeName: "file-tool-node",
+	})
+	if err != nil {
+		t.Fatalf("mesh: %v", err)
+	}
+	t.Cleanup(func() { m.Close() })
+
+	if err := m.RegisterFileTool(store); err != nil {
+		t.Fatalf("register file tool: %v", err)
+	}
+
+	nc.Flush()
+	time.Sleep(50 * time.Millisecond)
+
+	return nc, m
+}
+
 func natsRequest(t *testing.T, nc *nats.Conn, subject string, req interface{}) []byte {
 	t.Helper()
 	data, err := json.Marshal(req)
@@ -91,6 +127,114 @@ func natsRequest(t *testing.T, nc *nats.Conn, subject string, req interface{}) [
 		t.Fatalf("request %s: %v", subject, err)
 	}
 	return msg.Data
+}
+
+func TestFileToolDiscovery(t *testing.T) {
+	_, m := setupFileTool(t)
+
+	services, err := m.ListServices()
+	if err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+
+	var endpoints map[string]string
+	for _, svc := range services {
+		if svc.Name != "files" {
+			continue
+		}
+		if svc.Version != "1.0.0" {
+			t.Fatalf("files version = %q, want 1.0.0", svc.Version)
+		}
+		if svc.Metadata["node"] != "file-tool-node" {
+			t.Fatalf("files node metadata = %q, want file-tool-node", svc.Metadata["node"])
+		}
+		endpoints = make(map[string]string, len(svc.Endpoints))
+		for _, ep := range svc.Endpoints {
+			endpoints[ep.Name] = ep.Subject
+			if ep.Metadata["schema"] == "" {
+				t.Fatalf("endpoint %s missing schema metadata", ep.Name)
+			}
+		}
+		break
+	}
+	if endpoints == nil {
+		t.Fatal("files service not discovered")
+	}
+	for _, method := range []string{"put", "get", "head", "delete", "list"} {
+		if endpoints[method] != "tools.files."+method {
+			t.Fatalf("endpoint %s subject = %q, want tools.files.%s", method, endpoints[method], method)
+		}
+	}
+}
+
+func TestFileToolCallRoundTrip(t *testing.T) {
+	_, m := setupFileTool(t)
+
+	content := []byte("tool-visible evidence")
+	put, err := m.Call("files", "put", map[string]interface{}{
+		"key":          "diagnostics/evidence.txt",
+		"data":         base64.StdEncoding.EncodeToString(content),
+		"content_type": "text/plain",
+	}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("call put: %v", err)
+	}
+	if !put.OK {
+		t.Fatalf("put failed: %s", put.Error)
+	}
+	putResult := put.Result.(map[string]interface{})
+	if putResult["key"] != "diagnostics/evidence.txt" {
+		t.Fatalf("put key = %v", putResult["key"])
+	}
+
+	head, err := m.Call("files", "head", map[string]interface{}{"key": "diagnostics/evidence.txt"}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("call head: %v", err)
+	}
+	if !head.OK {
+		t.Fatalf("head failed: %s", head.Error)
+	}
+	headResult := head.Result.(map[string]interface{})
+	if int64(headResult["size"].(float64)) != int64(len(content)) {
+		t.Fatalf("head size = %v, want %d", headResult["size"], len(content))
+	}
+
+	get, err := m.Call("files", "get", map[string]interface{}{"key": "diagnostics/evidence.txt"}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("call get: %v", err)
+	}
+	if !get.OK {
+		t.Fatalf("get failed: %s", get.Error)
+	}
+	getResult := get.Result.(map[string]interface{})
+	data, err := base64.StdEncoding.DecodeString(getResult["data"].(string))
+	if err != nil {
+		t.Fatalf("decode get data: %v", err)
+	}
+	if string(data) != string(content) {
+		t.Fatalf("get data = %q, want %q", data, content)
+	}
+
+	list, err := m.Call("files", "list", map[string]interface{}{"prefix": "diagnostics/"}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("call list: %v", err)
+	}
+	if !list.OK {
+		t.Fatalf("list failed: %s", list.Error)
+	}
+	listResult := list.Result.(map[string]interface{})
+	files := listResult["files"].([]interface{})
+	if len(files) != 1 {
+		t.Fatalf("list returned %d files, want 1", len(files))
+	}
+
+	del, err := m.Call("files", "delete", map[string]interface{}{"key": "diagnostics/evidence.txt"}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("call delete: %v", err)
+	}
+	if !del.OK {
+		t.Fatalf("delete failed: %s", del.Error)
+	}
 }
 
 func TestFilePut(t *testing.T) {

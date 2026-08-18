@@ -23,6 +23,8 @@ import (
 	"github.com/richinsley/jb-mesh/pkg/filestore"
 )
 
+const fileToolName = "files"
+
 // --- Request/Response types ---
 
 // FilePutRequest is sent to files.put.
@@ -129,6 +131,240 @@ func (m *Mesh) SubscribeFileHandlers(store *filestore.Store) error {
 
 	m.logf("[mesh] file store handlers registered (5 subjects)")
 	return nil
+}
+
+// RegisterFileTool exposes the built-in file store through normal mesh tool
+// discovery while preserving the legacy raw files.* request/reply subjects.
+func (m *Mesh) RegisterFileTool(store *filestore.Store) error {
+	return m.RegisterTool(
+		fileToolName,
+		"1.0.0",
+		"Built-in ephemeral mesh file store for exchanging larger blobs by key",
+		[]string{"put", "get", "head", "delete", "list"},
+		fileToolHandler(store),
+		FileToolMethodSchemas(),
+	)
+}
+
+// FileToolMethodSchemas returns JSON-schema-like metadata for the discoverable
+// built-in files tool.
+func FileToolMethodSchemas() map[string]MethodSchema {
+	keyProp := map[string]interface{}{
+		"type":        "string",
+		"description": "File store object key.",
+	}
+	return map[string]MethodSchema{
+		"put": {
+			Type:        "object",
+			Description: "Store a base64-encoded blob in the mesh file store.",
+			Required:    []string{"key", "data"},
+			Properties: map[string]interface{}{
+				"key": keyProp,
+				"data": map[string]interface{}{
+					"type":        "string",
+					"description": "Base64-encoded file content.",
+				},
+				"content_type": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional MIME content type. Defaults to application/octet-stream.",
+				},
+			},
+		},
+		"get": {
+			Type:        "object",
+			Description: "Retrieve a blob from the mesh file store by key. Data is returned base64-encoded.",
+			Required:    []string{"key"},
+			Properties: map[string]interface{}{
+				"key": keyProp,
+			},
+		},
+		"head": {
+			Type:        "object",
+			Description: "Retrieve metadata for a blob without returning its content.",
+			Required:    []string{"key"},
+			Properties: map[string]interface{}{
+				"key": keyProp,
+			},
+		},
+		"delete": {
+			Type:        "object",
+			Description: "Delete a blob from the mesh file store.",
+			Required:    []string{"key"},
+			Properties: map[string]interface{}{
+				"key": keyProp,
+			},
+		},
+		"list": {
+			Type:        "object",
+			Description: "List blobs in the mesh file store, optionally filtered by key prefix.",
+			Properties: map[string]interface{}{
+				"prefix": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional key prefix filter.",
+				},
+			},
+		},
+	}
+}
+
+// FileToolSchema returns the method schemas in the same shape as
+// node.<node>.tools.<tool>.schema responses.
+func FileToolSchema() map[string]interface{} {
+	schemas := FileToolMethodSchemas()
+	out := make(map[string]interface{}, len(schemas))
+	for name, schema := range schemas {
+		data, err := json.Marshal(schema)
+		if err != nil {
+			continue
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			continue
+		}
+		out[name] = raw
+	}
+	return out
+}
+
+func fileToolHandler(store *filestore.Store) ToolHandler {
+	return func(req CallRequest, method string, params map[string]interface{}) (interface{}, error) {
+		switch method {
+		case "put":
+			return fileToolPut(store, params)
+		case "get":
+			return fileToolGet(store, params)
+		case "head":
+			return fileToolHead(store, params)
+		case "delete":
+			return fileToolDelete(store, params)
+		case "list":
+			return fileToolList(store, params)
+		default:
+			return nil, fmt.Errorf("unknown files method %q", method)
+		}
+	}
+}
+
+func fileToolPut(store *filestore.Store, params map[string]interface{}) (FilePutResult, error) {
+	key, err := stringParam(params, "key", true)
+	if err != nil {
+		return FilePutResult{}, err
+	}
+	encoded, err := stringParam(params, "data", true)
+	if err != nil {
+		return FilePutResult{}, err
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return FilePutResult{}, fmt.Errorf("invalid base64 data: %w", err)
+	}
+	ct, err := stringParam(params, "content_type", false)
+	if err != nil {
+		return FilePutResult{}, err
+	}
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	meta, err := store.Put(key, data, ct)
+	if err != nil {
+		return FilePutResult{}, err
+	}
+	return FilePutResult{
+		OK:          true,
+		Key:         meta.Key,
+		Size:        meta.Size,
+		ContentType: meta.ContentType,
+		ETag:        meta.ETag,
+	}, nil
+}
+
+func fileToolGet(store *filestore.Store, params map[string]interface{}) (FileGetResult, error) {
+	key, err := stringParam(params, "key", true)
+	if err != nil {
+		return FileGetResult{}, err
+	}
+	data, meta, err := store.Get(key)
+	if err != nil {
+		return FileGetResult{}, err
+	}
+	return FileGetResult{
+		OK:          true,
+		Key:         meta.Key,
+		Data:        base64.StdEncoding.EncodeToString(data),
+		ContentType: meta.ContentType,
+		Size:        meta.Size,
+		ETag:        meta.ETag,
+	}, nil
+}
+
+func fileToolHead(store *filestore.Store, params map[string]interface{}) (FileHeadResult, error) {
+	key, err := stringParam(params, "key", true)
+	if err != nil {
+		return FileHeadResult{}, err
+	}
+	meta, err := store.Head(key)
+	if err != nil {
+		return FileHeadResult{}, err
+	}
+	return FileHeadResult{
+		OK:          true,
+		Key:         meta.Key,
+		ContentType: meta.ContentType,
+		Size:        meta.Size,
+		ETag:        meta.ETag,
+		Created:     meta.Created.Format("2006-01-02T15:04:05Z07:00"),
+	}, nil
+}
+
+func fileToolDelete(store *filestore.Store, params map[string]interface{}) (FileDeleteResult, error) {
+	key, err := stringParam(params, "key", true)
+	if err != nil {
+		return FileDeleteResult{}, err
+	}
+	if err := store.Delete(key); err != nil {
+		return FileDeleteResult{}, err
+	}
+	return FileDeleteResult{OK: true}, nil
+}
+
+func fileToolList(store *filestore.Store, params map[string]interface{}) (FileListResult, error) {
+	prefix, err := stringParam(params, "prefix", false)
+	if err != nil {
+		return FileListResult{}, err
+	}
+	files, err := store.List(prefix)
+	if err != nil {
+		return FileListResult{}, err
+	}
+	items := make([]FileListItem, len(files))
+	for i, f := range files {
+		items[i] = FileListItem{
+			Key:         f.Key,
+			Size:        f.Size,
+			ContentType: f.ContentType,
+			ETag:        f.ETag,
+			Created:     f.Created.Format("2006-01-02T15:04:05Z07:00"),
+		}
+	}
+	return FileListResult{OK: true, Files: items}, nil
+}
+
+func stringParam(params map[string]interface{}, key string, required bool) (string, error) {
+	value, ok := params[key]
+	if !ok || value == nil {
+		if required {
+			return "", fmt.Errorf("%s is required", key)
+		}
+		return "", nil
+	}
+	s, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", key)
+	}
+	if required && s == "" {
+		return "", fmt.Errorf("%s is required", key)
+	}
+	return s, nil
 }
 
 func (m *Mesh) subscribeFilePut(store *filestore.Store) error {
