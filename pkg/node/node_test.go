@@ -124,6 +124,54 @@ func TestNewUsesConfiguredEmbeddedBindHosts(t *testing.T) {
 	}
 }
 
+func TestNewSeedAdvertisesBuiltInFileStoreTool(t *testing.T) {
+	n, err := New(Config{
+		NodeName:  "filestore-seed",
+		HomeDir:   t.TempDir(),
+		NoMDNS:    true,
+		Role:      "seed",
+		EmbedPort: -1,
+		LeafPort:  -1,
+		Logging:   LoggingConfig{Quiet: true},
+	})
+	if err != nil {
+		t.Fatalf("New node: %v", err)
+	}
+	t.Cleanup(n.Close)
+
+	services, err := n.mesh.ListServices()
+	if err != nil {
+		t.Fatalf("list services: %v", err)
+	}
+	found := false
+	for _, svc := range services {
+		if svc.Name != "files" {
+			continue
+		}
+		found = true
+		if svc.Version != "1.0.0" {
+			t.Fatalf("files version = %q, want 1.0.0", svc.Version)
+		}
+		if svc.Metadata["node"] != "filestore-seed" {
+			t.Fatalf("files node metadata = %q, want filestore-seed", svc.Metadata["node"])
+		}
+		if len(svc.Endpoints) != 5 {
+			t.Fatalf("files endpoints = %d, want 5", len(svc.Endpoints))
+		}
+	}
+	if !found {
+		t.Fatal("files service not discovered")
+	}
+
+	schema, err := n.GetToolSchema("files")
+	if err != nil {
+		t.Fatalf("get files schema: %v", err)
+	}
+	if _, ok := schema["get"]; !ok {
+		t.Fatalf("files schema missing get method: %#v", schema)
+	}
+}
+
 func TestSlogNATSLoggerRoutesMessages(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
