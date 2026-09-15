@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/richinsley/jb-mesh/pkg/config"
 	"github.com/richinsley/jb-mesh/pkg/sdk"
@@ -283,7 +284,7 @@ __name__ = "__main__"
 exec(open(%q).read())
 `, entrypoint)
 
-	_, err = repl.Execute(initCode, true)
+	_, err = repl.ExecuteWithTimeout(initCode, true, replStartupTimeout(tool.Manifest.Runtime.StartupTimeout))
 	if err != nil {
 		return fmt.Errorf("failed to run entrypoint: %w", err)
 	}
@@ -294,14 +295,17 @@ import builtins
 if hasattr(builtins, '__jb_call__'):
     __jb_call__ = builtins.__jb_call__
 `
-	_, err = repl.Execute(importCode, true)
+	_, err = repl.ExecuteWithTimeout(importCode, true, replStartupTimeout(tool.Manifest.Runtime.StartupTimeout))
 	if err != nil {
 		return fmt.Errorf("failed to import jb functions: %w", err)
 	}
 
-	// Call the setup method
-	callCode := fmt.Sprintf(`__jb_call__(%q, {})`, method)
-	result, err := repl.Execute(callCode, true)
+	// Call the setup method.
+	callCode, err := buildREPLCallExpr(method, nil)
+	if err != nil {
+		return err
+	}
+	result, err := repl.ExecuteWithTimeout(callCode, true, time.Duration(timeout)*time.Second)
 	if err != nil {
 		return fmt.Errorf("setup call failed: %w", err)
 	}

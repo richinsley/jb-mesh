@@ -223,7 +223,7 @@ func IsProcessAlive(executor *Executor, toolName string) func() error {
 
 		if hasRepl && repl != nil {
 			// Try a simple expression
-			result, err := repl.Execute("1+1", true)
+			result, err := repl.ExecuteWithTimeout("1+1", true, 5*time.Second)
 			if err != nil {
 				return fmt.Errorf("REPL unresponsive: %w", err)
 			}

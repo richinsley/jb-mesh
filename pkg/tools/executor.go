@@ -13,6 +13,15 @@ import (
 	"github.com/richinsley/jumpboot"
 )
 
+var defaultREPLCallTimeout = 5 * time.Minute
+
+func replStartupTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return time.Minute
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // CallResponse represents the response from a jb-service call
 type CallResponse struct {
 	OK     bool        `json:"ok"`
@@ -260,7 +269,7 @@ func (e *Executor) callOneshot(tool *Tool, methodName string, params map[string]
 	}
 
 	// Make the call using __jb_call__
-	return e.doCall(repl, methodName, params)
+	return e.doCall("", repl, methodName, params)
 }
 
 // callPersistent calls a method on a running persistent tool (REPL transport)
@@ -273,7 +282,7 @@ func (e *Executor) callPersistent(tool *Tool, methodName string, params map[stri
 		return nil, fmt.Errorf("tool %s is not running, start it first", tool.Name)
 	}
 
-	return e.doCall(repl, methodName, params)
+	return e.doCall(tool.Name, repl, methodName, params)
 }
 
 // callOneshotMsgpack runs a tool for a single call using MessagePack transport
@@ -334,6 +343,8 @@ func (e *Executor) doQueueCall(queue *jumpboot.QueueProcess, methodName string, 
 
 // initializeService runs the tool's main.py and waits for __JB_READY__
 func (e *Executor) initializeService(repl *jumpboot.REPLPythonProcess, entrypoint string, timeoutSec int) error {
+	timeout := replStartupTimeout(timeoutSec)
+
 	// Execute the entrypoint file with __name__ set to "__main__"
 	// This is required for the `if __name__ == "__main__": run(Service)` pattern
 	// The run() function registers __jb_call__ etc. in builtins
@@ -342,7 +353,7 @@ __name__ = "__main__"
 exec(open(%q).read())
 `, entrypoint)
 
-	_, err := repl.Execute(initCode, true)
+	_, err := repl.ExecuteWithTimeout(initCode, true, timeout)
 	if err != nil {
 		return fmt.Errorf("failed to run entrypoint: %w", err)
 	}
@@ -357,14 +368,14 @@ if hasattr(builtins, '__jb_call__'):
     __jb_methods__ = builtins.__jb_methods__
     __jb_shutdown__ = builtins.__jb_shutdown__
 `
-	_, err = repl.Execute(importCode, true)
+	_, err = repl.ExecuteWithTimeout(importCode, true, timeout)
 	if err != nil {
 		return fmt.Errorf("failed to import jb functions: %w", err)
 	}
 
 	// Check that __jb_call__ is available
 	checkCode := `"ready" if callable(globals().get("__jb_call__")) else "not ready"`
-	result, err := repl.Execute(checkCode, true)
+	result, err := repl.ExecuteWithTimeout(checkCode, true, timeout)
 	if err != nil {
 		return fmt.Errorf("failed to check service status: %w", err)
 	}
@@ -377,26 +388,54 @@ if hasattr(builtins, '__jb_call__'):
 }
 
 // doCall executes a method using the __jb_call__ protocol
-func (e *Executor) doCall(repl *jumpboot.REPLPythonProcess, methodName string, params map[string]interface{}) (interface{}, error) {
+func buildREPLCallExpr(methodName string, params map[string]interface{}) (string, error) {
 	if params == nil {
 		params = make(map[string]interface{})
 	}
 
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal params: %w", err)
+		return "", fmt.Errorf("failed to marshal params: %w", err)
 	}
 
-	// Call __jb_call__(method, params)
-	callExpr := fmt.Sprintf(`__jb_call__(%q, %s)`, methodName, string(paramsJSON))
+	return fmt.Sprintf(`__jb_call__(%q, __import__("json").loads(%q))`, methodName, string(paramsJSON)), nil
+}
 
-	result, err := repl.Execute(callExpr, true)
+// doCall executes a method using the __jb_call__ protocol.
+func (e *Executor) doCall(toolName string, repl *jumpboot.REPLPythonProcess, methodName string, params map[string]interface{}) (interface{}, error) {
+	callExpr, err := buildREPLCallExpr(methodName, params)
 	if err != nil {
+		return nil, err
+	}
+
+	result, err := repl.ExecuteWithTimeout(callExpr, true, defaultREPLCallTimeout)
+	if err != nil {
+		if toolName != "" {
+			e.markReplStopped(toolName, repl)
+		}
 		return nil, fmt.Errorf("call failed: %w", err)
 	}
 
 	// Parse the response
 	return e.parseResponse(result)
+}
+
+func (e *Executor) markReplStopped(toolName string, repl *jumpboot.REPLPythonProcess) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if current, ok := e.repls[toolName]; ok && current == repl {
+		delete(e.repls, toolName)
+	}
+	if cancel, ok := e.healthCancels[toolName]; ok {
+		cancel()
+		delete(e.healthCancels, toolName)
+	}
+	if tool, ok := e.manager.Get(toolName); ok {
+		tool.Status = "stopped"
+		tool.HealthStatus = "unhealthy"
+		tool.HealthFailures++
+	}
 }
 
 // parseResponse parses a jb-service response
@@ -775,7 +814,7 @@ func (e *Executor) doHealthCheck(tool *Tool, method string) error {
 	}
 
 	// Call the health method via __jb_call__
-	result, err := e.doCall(repl, method, nil)
+	result, err := e.doCall(tool.Name, repl, method, nil)
 	if err != nil {
 		return fmt.Errorf("health call failed: %w", err)
 	}
@@ -896,7 +935,7 @@ func (e *Executor) GetSchema(toolName string) (map[string]interface{}, error) {
 
 // getSchemaFromRepl gets schema using __jb_schema__
 func (e *Executor) getSchemaFromRepl(repl *jumpboot.REPLPythonProcess) (map[string]interface{}, error) {
-	result, err := repl.Execute("__jb_schema__()", true)
+	result, err := repl.ExecuteWithTimeout("__jb_schema__()", true, defaultREPLCallTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get schema: %w", err)
 	}

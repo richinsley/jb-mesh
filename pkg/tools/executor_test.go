@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -86,6 +87,183 @@ func TestExecutorCall_Health(t *testing.T) {
 	status := resultMap["status"].(string)
 	if status != "ok" {
 		t.Fatalf("expected status ok, got %s", status)
+	}
+}
+
+func TestExecutorCall_REPLMarshalsJSONValuesAsData(t *testing.T) {
+	skipIfNoJumpboot(t)
+
+	cfg := testConfig(t)
+	toolDir := filepath.Join(t.TempDir(), "repl-json-values")
+	if err := os.MkdirAll(toolDir, 0755); err != nil {
+		t.Fatalf("mkdir tool dir: %v", err)
+	}
+
+	manifest := `name: repl-json-values
+version: 1.0.0
+description: Test REPL JSON value marshalling
+runtime:
+  python: "3.11"
+  mode: oneshot
+  transport: repl
+  packages:
+    - pydantic>=2.0
+    - ` + testJBServicePackage(t) + `
+rpc:
+  methods:
+    inspect:
+      description: Inspect JSON-ish values
+`
+	if err := os.WriteFile(filepath.Join(toolDir, "jumpboot.yaml"), []byte(manifest), 0644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	mainPy := `from jb_service import Service, method, run
+
+class JSONValues(Service):
+    name = "repl-json-values"
+    version = "1.0.0"
+
+    @method
+    def inspect(self, flag: bool = True, other: bool = False, optional = "set") -> dict:
+        return {
+            "flag": flag,
+            "flag_type": type(flag).__name__,
+            "other": other,
+            "other_type": type(other).__name__,
+            "optional_is_none": optional is None,
+        }
+
+if __name__ == "__main__":
+    run(JSONValues)
+`
+	if err := os.WriteFile(filepath.Join(toolDir, "main.py"), []byte(mainPy), 0644); err != nil {
+		t.Fatalf("write main.py: %v", err)
+	}
+
+	mgr := NewManager(cfg)
+	mgr.LoadAll()
+	tool, err := mgr.Install(toolDir)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	exec := NewExecutor(mgr)
+	defer exec.Close()
+
+	result, err := exec.Call(tool.Name, "inspect", map[string]interface{}{
+		"flag":     false,
+		"other":    true,
+		"optional": nil,
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+
+	got, ok := result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map, got %T: %v", result, result)
+	}
+	if got["flag"] != false || got["flag_type"] != "bool" {
+		t.Fatalf("flag was not delivered as Python bool false: %#v", got)
+	}
+	if got["other"] != true || got["other_type"] != "bool" {
+		t.Fatalf("other was not delivered as Python bool true: %#v", got)
+	}
+	if got["optional_is_none"] != true {
+		t.Fatalf("optional was not delivered as Python None: %#v", got)
+	}
+}
+
+func TestExecutorCall_REPLTimeoutStopsPersistentWorker(t *testing.T) {
+	skipIfNoJumpboot(t)
+
+	oldTimeout := defaultREPLCallTimeout
+	defaultREPLCallTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { defaultREPLCallTimeout = oldTimeout })
+
+	cfg := testConfig(t)
+	toolDir := filepath.Join(t.TempDir(), "repl-hang")
+	if err := os.MkdirAll(toolDir, 0755); err != nil {
+		t.Fatalf("mkdir tool dir: %v", err)
+	}
+
+	manifest := `name: repl-hang
+version: 1.0.0
+description: Test REPL timeout cleanup
+runtime:
+  python: "3.11"
+  mode: persistent
+  transport: repl
+  packages:
+    - pydantic>=2.0
+    - ` + testJBServicePackage(t) + `
+rpc:
+  methods:
+    hang:
+      description: Sleep longer than the executor timeout
+    health:
+      description: Health check
+`
+	if err := os.WriteFile(filepath.Join(toolDir, "jumpboot.yaml"), []byte(manifest), 0644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	mainPy := `import time
+from jb_service import Service, method, run
+
+class Hang(Service):
+    name = "repl-hang"
+    version = "1.0.0"
+
+    @method
+    def hang(self) -> dict:
+        time.sleep(10)
+        return {"done": True}
+
+    @method
+    def health(self) -> dict:
+        return {"status": "ok"}
+
+if __name__ == "__main__":
+    run(Hang)
+`
+	if err := os.WriteFile(filepath.Join(toolDir, "main.py"), []byte(mainPy), 0644); err != nil {
+		t.Fatalf("write main.py: %v", err)
+	}
+
+	mgr := NewManager(cfg)
+	mgr.LoadAll()
+	tool, err := mgr.Install(toolDir)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	exec := NewExecutor(mgr)
+	defer exec.Close()
+	if err := exec.Start(tool.Name); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	start := time.Now()
+	_, err = exec.Call(tool.Name, "hang", nil)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("timeout took too long: %v", elapsed)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+
+	if tool.Status != "stopped" || tool.HealthStatus != "unhealthy" {
+		t.Fatalf("expected worker marked stopped/unhealthy, got status=%q health=%q", tool.Status, tool.HealthStatus)
+	}
+
+	_, err = exec.Call(tool.Name, "health", nil)
+	if err == nil || !strings.Contains(err.Error(), "not running") {
+		t.Fatalf("expected later call to fail as not running, got %v", err)
 	}
 }
 
