@@ -237,7 +237,7 @@ See [`docs/service-lifecycle.md`](docs/service-lifecycle.md) for the exact lifec
 
 ## Release status
 
-jb-mesh is preparing for a public release. The core is usable, but documentation, examples, and public packaging are still being hardened. Treat any pre-release API as subject to change.
+Public releases are available. APIs remain pre-1.0 and may change as the core, documentation, and examples mature.
 
 ## License
 

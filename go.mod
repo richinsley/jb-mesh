@@ -7,7 +7,7 @@ require (
 	github.com/nats-io/nats-server/v2 v2.12.5
 	github.com/nats-io/nats.go v1.49.0
 	github.com/nats-io/nuid v1.0.1
-	github.com/richinsley/jumpboot v1.2.2
+	github.com/richinsley/jumpboot v1.3.0
 	github.com/spf13/cobra v1.8.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -22,6 +22,7 @@ require (
 	github.com/minio/highwayhash v1.0.4-0.20251030100505-070ab1a87a76 // indirect
 	github.com/nats-io/jwt/v2 v2.8.0 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect
+	github.com/richinsley/goomba v0.1.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect

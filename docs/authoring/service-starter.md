@@ -157,10 +157,10 @@ For services that live below the repo root, the local mapping may also include a
 
 ```yaml
 services:
-  sable-log-reader:
+  log-reader:
     node: node-a
     repo: /path/to/jb-mesh
-    subdir: services/sable-log-reader
+    subdir: services/log-reader
 ```
 
 Never commit machine-local deployment targeting, private hostnames, local paths, or credentials into service repos.
