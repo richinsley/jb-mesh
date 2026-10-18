@@ -4,10 +4,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/richinsley/jb-mesh/pkg/config"
+	"github.com/richinsley/jumpboot"
 )
 
 // sharedEnvsDir is created once by TestMain and reused across all tests.
@@ -122,6 +124,92 @@ func TestNewManager(t *testing.T) {
 	mgr := NewManager(cfg)
 	if mgr == nil {
 		t.Fatal("expected non-nil manager")
+	}
+}
+
+func TestGoombaPreferenceReusesLegacyMicromambaBase(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake executables use POSIX shell scripts")
+	}
+	cfg := testConfig(t)
+	cfg.EnvsDir = t.TempDir()
+	cfg.CondaBackend = "goomba"
+	prefix := filepath.Join(cfg.EnvsDir, "envs", "base-3.11")
+	writeExecutable := func(path, output string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' '"+output+"'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mamba := filepath.Join(cfg.EnvsDir, "bin", "micromamba")
+	writeExecutable(mamba, "2.2.0")
+	writeExecutable(filepath.Join(prefix, "bin", "python"), "Python 3.11.9")
+	writeExecutable(filepath.Join(prefix, "bin", "pip"), "pip 24.0 from x (python 3.11)")
+	meta := filepath.Join(prefix, "conda-meta")
+	if err := os.MkdirAll(meta, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(meta, "history"), []byte("# cmd: "+mamba+" --root-prefix "+cfg.EnvsDir+" create -n base-3.11 python=3.11 -y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	env, err := NewManager(cfg).getOrCreateBase("3.11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Backend != jumpboot.BackendMicromamba || env.MicromambaPath != mamba || env.IsNew {
+		t.Fatalf("reused base = %+v, want existing micromamba backend", env.BaseEnvironment)
+	}
+}
+
+func TestUnknownCondaBackendRefusedBeforeCreation(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.EnvsDir = t.TempDir()
+	cfg.CondaBackend = "unknown"
+	if _, err := NewManager(cfg).getOrCreateBase("3.11"); err == nil || !strings.Contains(err.Error(), "unsupported conda_backend") {
+		t.Fatalf("unknown backend: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.EnvsDir, "envs")); !os.IsNotExist(err) {
+		t.Fatalf("unknown backend created a base: %v", err)
+	}
+}
+
+func TestGoombaBaseRejectsIncrementalCondaPackages(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake executables use POSIX shell scripts")
+	}
+	cfg := testConfig(t)
+	cfg.EnvsDir = t.TempDir()
+	cfg.CondaBackend = "goomba"
+	prefix := filepath.Join(cfg.EnvsDir, "envs", "base-3.11")
+	for name, output := range map[string]string{
+		"python": "Python 3.11.9",
+		"pip":    "pip 24.0 from x (python 3.11)",
+	} {
+		path := filepath.Join(prefix, "bin", name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' '"+output+"'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	meta := filepath.Join(prefix, "conda-meta")
+	if err := os.MkdirAll(meta, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(meta, "history"), []byte("# cmd: goomba create -p "+prefix+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &config.Manifest{Name: "sample", Runtime: config.Runtime{Python: "3.11", CondaPackages: []string{"numpy"}}}
+	if _, err := NewManager(cfg).createEnvironment(manifest); err == nil || !strings.Contains(err.Error(), "incremental conda installs are unsupported") {
+		t.Fatalf("Goomba-backed Conda package request: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.EnvsDir, "venvs", "sample")); !os.IsNotExist(err) {
+		t.Fatalf("venv created before refusal: %v", err)
 	}
 }
 

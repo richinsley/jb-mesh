@@ -57,6 +57,18 @@ make build
 # {"ok": true, "result": 5, "node": "node-a"}
 ```
 
+## Shared Python base backend
+
+By default, jb-mesh creates each shared `base-<python-version>` environment with micromamba, then creates a lightweight venv per tool. On Linux or macOS, set this in `~/.jb-mesh/config.yaml` to use [Goomba](https://github.com/richinsley/goomba) for **new** shared bases:
+
+```yaml
+conda_backend: goomba
+```
+
+`conda_backend` accepts `micromamba` (the default) or `goomba`. Existing bases keep the backend that created them, even after this setting changes: Jumpboot reads a marker on new bases and the first `conda-meta/history` creation command on legacy bases. Unknown or conflicting provenance is an error. In particular, switching this setting does not rebuild an existing micromamba base or make a Goomba base use micromamba. On Windows, new Goomba environments are not supported; keep the default micromamba setting there.
+
+This setting only selects shared-base creation. Tool pip dependencies still install into each tool's venv. A manifest with `runtime.conda_packages` is refused on a Goomba-created base: Goomba does not support the existing incremental Conda install path. An existing micromamba base keeps its original behavior even when Goomba is selected for new bases.
+
 ## Multi-node mesh
 
 For a LAN/dev setup, one node can act as the seed and other nodes can join as leaves.

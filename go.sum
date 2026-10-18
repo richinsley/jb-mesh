@@ -35,6 +35,8 @@ github.com/richinsley/goomba v0.1.0 h1:kxRaE1NKcrwfA6p0FKKqU3U5tILPHTL+HEu+68W4p
 github.com/richinsley/goomba v0.1.0/go.mod h1:2tW0mJoqxnzm+LGmsOLl6tip61vuy/HIUqNwBQgH+Ug=
 github.com/richinsley/jumpboot v1.3.0 h1:dSuP8NYdJLQoJ60WMZDfEUypKeo+tVJ/g0VPdleFOKM=
 github.com/richinsley/jumpboot v1.3.0/go.mod h1:x2huk83CgZ5AzOLYD8pLVw/hdbwdUNdtgfXJgv0nNVo=
+github.com/richinsley/jumpboot v1.3.1 h1:6RGNu0+FdFUyFGzwA7CWN3SecT6I1TAqv8FlZ87CiZk=
+github.com/richinsley/jumpboot v1.3.1/go.mod h1:x2huk83CgZ5AzOLYD8pLVw/hdbwdUNdtgfXJgv0nNVo=
 github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
 github.com/spf13/cobra v1.8.0 h1:7aJaZx1B85qltLMc546zn58BxxfZdR/W22ej9CFoEf0=
 github.com/spf13/cobra v1.8.0/go.mod h1:WXLWApfZ71AjXPya3WOlMsY9yMs7YeiHhFVlvLyhcho=

@@ -14,6 +14,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.EnvsDir == "" {
 		t.Fatal("EnvsDir should not be empty")
 	}
+	if cfg.CondaBackend != "micromamba" {
+		t.Fatalf("CondaBackend = %q, want micromamba", cfg.CondaBackend)
+	}
 	if cfg.APIPort != 9800 {
 		t.Fatalf("expected default APIPort 9800, got %d", cfg.APIPort)
 	}
@@ -75,6 +78,7 @@ func TestSaveAndLoad(t *testing.T) {
 	cfg.AuthToken = "test-token"
 	cfg.NATS.EmbedHost = "127.0.0.1"
 	cfg.NATS.LeafHost = "127.0.0.1"
+	cfg.CondaBackend = "goomba"
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save failed: %v", err)
 	}
@@ -88,6 +92,9 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if loaded.AuthToken != "test-token" {
 		t.Fatalf("expected AuthToken test-token, got %s", loaded.AuthToken)
+	}
+	if loaded.CondaBackend != "goomba" {
+		t.Fatalf("CondaBackend = %q, want goomba", loaded.CondaBackend)
 	}
 	if loaded.NATS.EmbedHost != "127.0.0.1" || loaded.NATS.LeafHost != "127.0.0.1" {
 		t.Fatalf("expected NATS bind hosts to round-trip, got embed=%q leaf=%q", loaded.NATS.EmbedHost, loaded.NATS.LeafHost)
