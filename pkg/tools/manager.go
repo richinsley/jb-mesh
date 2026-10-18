@@ -165,18 +165,20 @@ func (m *Manager) Install(source string) (*Tool, error) {
 	return tool, nil
 }
 
-// getOrCreateBase returns (or creates) the shared base mamba environment for a Python version.
+// getOrCreateBase returns (or creates) the shared Conda base for a Python version.
 // Base envs live at <envsDir>/base-<version> and are reused across all tools needing that version.
 func (m *Manager) getOrCreateBase(pythonVersion string) (*jumpboot.PythonEnvironment, error) {
 	baseName := fmt.Sprintf("base-%s", pythonVersion)
-
-	env, err := jumpboot.CreateEnvironmentMamba(
-		baseName,
-		m.cfg.EnvsDir,
-		pythonVersion,
-		"conda-forge",
-		nil, // progress callback
-	)
+	var env *jumpboot.PythonEnvironment
+	var err error
+	switch m.cfg.CondaBackend {
+	case "", "micromamba":
+		env, err = jumpboot.CreateEnvironmentMamba(baseName, m.cfg.EnvsDir, pythonVersion, "conda-forge", nil)
+	case "goomba":
+		env, err = jumpboot.CreateEnvironmentGoomba(baseName, m.cfg.EnvsDir, pythonVersion, "conda-forge", nil)
+	default:
+		return nil, fmt.Errorf("unsupported conda_backend %q: use micromamba or goomba", m.cfg.CondaBackend)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -191,13 +193,16 @@ func (m *Manager) getOrCreateBase(pythonVersion string) (*jumpboot.PythonEnviron
 // createEnvironment creates a lightweight venv for a tool on top of a shared base env.
 // Layout:
 //
-//	<envsDir>/base-3.11/       ← full mamba install (shared)
+//	<envsDir>/base-3.11/       ← full Conda install (shared)
 //	<envsDir>/venvs/calculator/ ← lightweight venv (per-tool site-packages only)
 func (m *Manager) createEnvironment(manifest *config.Manifest) (*jumpboot.PythonEnvironment, error) {
 	// Get or create the shared base for this Python version
 	baseEnv, err := m.getOrCreateBase(manifest.Runtime.Python)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create base env for Python %s: %w", manifest.Runtime.Python, err)
+	}
+	if baseEnv.Backend == jumpboot.BackendGoomba && len(manifest.Runtime.CondaPackages) > 0 {
+		return nil, fmt.Errorf("tool %s declares runtime.conda_packages, but incremental conda installs are unsupported with a Goomba-created base", manifest.Name)
 	}
 
 	// Create a lightweight venv on top of the base

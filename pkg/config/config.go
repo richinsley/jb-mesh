@@ -10,12 +10,16 @@ import (
 
 // Config is the global jb-mesh configuration
 type Config struct {
-	HomeDir   string `yaml:"-"`          // Base directory (not saved to yaml)
-	ToolsDir  string `yaml:"tools_dir"`  // Where tools are installed
-	EnvsDir   string `yaml:"envs_dir"`   // Where jumpboot environments live
-	RunDir    string `yaml:"run_dir"`    // Runtime state (pids, sockets)
-	APIPort   int    `yaml:"api_port"`   // Default API server port
-	AuthToken string `yaml:"auth_token"` // Optional auth token
+	HomeDir  string `yaml:"-"`         // Base directory (not saved to yaml)
+	ToolsDir string `yaml:"tools_dir"` // Where tools are installed
+	EnvsDir  string `yaml:"envs_dir"`  // Where jumpboot environments live
+	// CondaBackend selects how new shared Python base environments are created.
+	// Existing bases keep their recorded creator backend. Values: micromamba
+	// (default) or goomba.
+	CondaBackend string `yaml:"conda_backend,omitempty"`
+	RunDir       string `yaml:"run_dir"`    // Runtime state (pids, sockets)
+	APIPort      int    `yaml:"api_port"`   // Default API server port
+	AuthToken    string `yaml:"auth_token"` // Optional auth token
 
 	// Node identity and capabilities
 	Node NodeConfig `yaml:"node"`
@@ -186,11 +190,12 @@ func DefaultConfigWithHome(homeDir string) *Config {
 	base := GetHomeDir(homeDir)
 
 	return &Config{
-		HomeDir:  base,
-		ToolsDir: filepath.Join(base, "tools"),
-		EnvsDir:  filepath.Join(base, "envs"),
-		RunDir:   filepath.Join(base, "run"),
-		APIPort:  9800,
+		HomeDir:      base,
+		ToolsDir:     filepath.Join(base, "tools"),
+		EnvsDir:      filepath.Join(base, "envs"),
+		CondaBackend: "micromamba",
+		RunDir:       filepath.Join(base, "run"),
+		APIPort:      9800,
 		Discovery: DiscoveryConfig{
 			MDNS:    true,
 			Cluster: true,
