@@ -113,6 +113,7 @@ type Authorization struct {
 // AuthorizedPrincipal is one external principal admitted by typed authorization.
 // Password is the secret credential material for NATS user/pass auth; subject
 // strings are NATS subtree permissions such as "poppi.mesh.host.op.alice.>".
+// An empty allow list denies all subjects in that direction.
 type AuthorizedPrincipal struct {
 	PrincipalID    string
 	Password       string
@@ -800,12 +801,22 @@ func authorizationUsers(authz Authorization) []*natsserver.User {
 			Username: p.PrincipalID,
 			Password: p.Password,
 			Permissions: &natsserver.Permissions{
-				Publish:   &natsserver.SubjectPermission{Allow: append([]string(nil), p.PublishAllow...)},
-				Subscribe: &natsserver.SubjectPermission{Allow: append([]string(nil), p.SubscribeAllow...)},
+				Publish:   authorizationPermission(p.PublishAllow),
+				Subscribe: authorizationPermission(p.SubscribeAllow),
 			},
 		})
 	}
 	return users
+}
+
+func authorizationPermission(allow []string) *natsserver.SubjectPermission {
+	permission := &natsserver.SubjectPermission{Allow: append([]string{}, allow...)}
+	if len(allow) == 0 {
+		// NATS treats a missing allow list as unrestricted in both directions.
+		// An explicit deny keeps an empty grant closed, including after reload.
+		permission.Deny = []string{">"}
+	}
+	return permission
 }
 
 func startEmbeddedNATSOptions(opts *natsserver.Options, logging LoggingConfig) (*natsserver.Server, error) {
