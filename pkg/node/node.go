@@ -34,6 +34,7 @@ import (
 // Node represents a single jb-mesh node
 type Node struct {
 	cfg              *config.Config
+	noFileServe      bool // preserve file-key resolution without serving files
 	mesh             *mesh.Mesh
 	manager          *tools.Manager
 	executor         *tools.Executor
@@ -86,6 +87,10 @@ type Config struct {
 	WebsocketHost string // embedded NATS websocket bind host; empty disables websocket
 	WebsocketPort int    // embedded NATS websocket bind port
 	Logging       LoggingConfig
+	// DisableFileServing retains file-key parameter resolution through the
+	// mesh, but does not register the built-in files service or raw files.*
+	// handlers. Use on clients without authority to serve the Object Store.
+	DisableFileServing bool
 
 	// EmbedPort overrides the embedded NATS client port. If zero, the value
 	// from <HomeDir>/jb-mesh.yaml is used, falling back to DefaultNATSPort
@@ -337,10 +342,11 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:        jbCfg,
-		log:        newNodeLog(cfg.Logging),
-		logging:    cfg.Logging,
-		streamSubs: make(map[string][]*nats.Subscription),
+		cfg:         jbCfg,
+		noFileServe: cfg.DisableFileServing,
+		log:         newNodeLog(cfg.Logging),
+		logging:     cfg.Logging,
+		streamSubs:  make(map[string][]*nats.Subscription),
 	}
 
 	natsPort := jbCfg.NATS.EmbedPort
@@ -638,11 +644,13 @@ func New(cfg Config) (*Node, error) {
 		if err != nil {
 			n.logf("[node] warning: failed to create file store: %v", err)
 		} else {
-			if err := m.SubscribeFileHandlers(store); err != nil {
-				n.logf("[node] warning: failed to register file store handlers: %v", err)
-			}
-			if err := m.RegisterFileTool(store); err != nil {
-				n.logf("[node] warning: failed to register file store tool: %v", err)
+			if !n.noFileServe {
+				if err := m.SubscribeFileHandlers(store); err != nil {
+					n.logf("[node] warning: failed to register file store handlers: %v", err)
+				}
+				if err := m.RegisterFileTool(store); err != nil {
+					n.logf("[node] warning: failed to register file store tool: %v", err)
+				}
 			}
 			m.SetFileStore(store) // Enable file param resolution in tool calls
 		}
@@ -1460,6 +1468,9 @@ func (n *Node) Role() string {
 // Prefers manifest-based schemas when available (no REPL spinup needed)
 func (n *Node) GetToolSchema(toolName string) (map[string]interface{}, error) {
 	if toolName == "files" {
+		if n.noFileServe {
+			return nil, fmt.Errorf("tool not found: %s", toolName)
+		}
 		return mesh.FileToolSchema(), nil
 	}
 
@@ -1699,8 +1710,10 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 	if err == nil {
 		store, err := filestore.NewStore(js, filestore.DefaultConfig())
 		if err == nil {
-			_ = m.SubscribeFileHandlers(store)
-			_ = m.RegisterFileTool(store)
+			if !n.noFileServe {
+				_ = m.SubscribeFileHandlers(store)
+				_ = m.RegisterFileTool(store)
+			}
 			m.SetFileStore(store) // Enable file param resolution in tool calls
 		}
 	}

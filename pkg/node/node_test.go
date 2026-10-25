@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -170,6 +171,89 @@ func TestNewSeedAdvertisesBuiltInFileStoreTool(t *testing.T) {
 	if _, ok := schema["get"]; !ok {
 		t.Fatalf("files schema missing get method: %#v", schema)
 	}
+}
+
+func TestAttachedNodeCanResolveFileKeysWithoutAdvertisingFileServing(t *testing.T) {
+	seed, err := New(Config{NodeName: "files-seed", HomeDir: t.TempDir(), NoMDNS: true,
+		Role: "seed", EmbedPort: -1, LeafPort: -1, Logging: LoggingConfig{Quiet: true}})
+	if err != nil {
+		t.Fatalf("start seed: %v", err)
+	}
+	t.Cleanup(seed.Close)
+	leaf, err := New(Config{NodeName: "service-leaf", HomeDir: t.TempDir(), NoMDNS: true,
+		NATSUrl: seed.natsServer.ClientURL(), DisableFileServing: true, Logging: LoggingConfig{Quiet: true}})
+	if err != nil {
+		t.Fatalf("start attached leaf: %v", err)
+	}
+	t.Cleanup(leaf.Close)
+	assertFileServiceNodes := func() {
+		t.Helper()
+		services, err := seed.mesh.ListServices()
+		if err != nil {
+			t.Fatalf("list services: %v", err)
+		}
+		var fileNodes []string
+		for _, svc := range services {
+			if svc.Name == "files" {
+				fileNodes = append(fileNodes, svc.Metadata["node"])
+			}
+		}
+		if len(fileNodes) != 1 || fileNodes[0] != "files-seed" {
+			t.Fatalf("files advertised by %v, want seed only", fileNodes)
+		}
+	}
+	assertFileServiceNodes()
+	if _, err := leaf.GetToolSchema("files"); err == nil {
+		t.Fatal("non-serving leaf claimed the built-in files schema")
+	}
+	if result, err := seed.mesh.Call("files", "list", map[string]interface{}{}, time.Second, "service-leaf"); err == nil && result != nil && result.OK {
+		t.Fatalf("non-serving leaf answered a node-pinned files.list: %+v", result)
+	}
+
+	const content = "file-key parameter still resolves"
+	request, _ := json.Marshal(mesh.FilePutRequest{Key: "proof/input.txt", Data: base64.StdEncoding.EncodeToString([]byte(content))})
+	reply, err := seed.mesh.Conn().Request("files.put", request, 3*time.Second)
+	if err != nil {
+		t.Fatalf("seed files.put: %v", err)
+	}
+	var put mesh.FilePutResult
+	if err := json.Unmarshal(reply.Data, &put); err != nil || !put.OK {
+		t.Fatalf("seed files.put result: %+v (%v)", put, err)
+	}
+	if err := leaf.mesh.RegisterTool("file-key-probe", "1.0.0", "probe", []string{"read"},
+		func(_ mesh.CallRequest, _ string, params map[string]interface{}) (interface{}, error) {
+			path, _ := params["input_file"].(string)
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return nil, err
+			}
+			return string(body), nil
+		}); err != nil {
+		t.Fatalf("register probe: %v", err)
+	}
+	if err := leaf.mesh.Conn().FlushTimeout(2 * time.Second); err != nil {
+		t.Fatalf("flush probe subscription: %v", err)
+	}
+	result, err := seed.mesh.Call("file-key-probe", "read", map[string]interface{}{"input_file": "proof/input.txt"}, 4*time.Second, "service-leaf")
+	if err != nil || result == nil || !result.OK || result.Result != content {
+		t.Fatalf("leaf file-key call = %+v, %v", result, err)
+	}
+
+	beforeReconnects := leaf.mesh.Conn().Stats().Reconnects
+	if err := leaf.mesh.Conn().ForceReconnect(); err != nil {
+		t.Fatalf("force reconnect: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for leaf.mesh.Conn().Stats().Reconnects == beforeReconnects && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if leaf.mesh.Conn().Stats().Reconnects == beforeReconnects {
+		t.Fatal("forced reconnect did not happen; replay proof would be vacuous")
+	}
+	if err := leaf.mesh.Conn().FlushTimeout(2 * time.Second); err != nil {
+		t.Fatalf("reconnect flush: %v", err)
+	}
+	assertFileServiceNodes()
 }
 
 func TestSlogNATSLoggerRoutesMessages(t *testing.T) {
