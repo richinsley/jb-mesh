@@ -52,14 +52,23 @@ type Node struct {
 	authorization    Authorization        // prepared auth; preserves the internal client credential
 	discovery        *discovery.Discovery // non-nil if mDNS enabled
 	nodeName         string
-	role             string     // "seed" or "leaf" (empty if pure client mode)
-	startedAt        int64      // unix seconds, for split-brain tiebreaker
-	token            string     // saved for demotion reconnect
-	natsPort         int        // saved for demotion reconnect
-	natsHost         string     // saved for demotion reconnect
-	leafPort         int        // saved for demotion reconnect
-	leafHost         string     // saved for demotion reconnect
-	mu               sync.Mutex // protects role transitions (demotion)
+	role             string // "seed" or "leaf" (empty if pure client mode)
+	startedAt        int64  // unix seconds, for split-brain tiebreaker
+	token            string // saved for demotion reconnect
+	// The node's own client identity, saved so every mesh connection it opens
+	// (the first one and the one after a demotion) is built the same way. A
+	// reconnect that dropped the credentials would be refused by a seed with
+	// typed authorization, and one that dropped the inbox prefix would have
+	// its reply subscriptions refused by a seed that scopes replies.
+	clientUsername    string
+	clientPassword    string
+	clientInboxPrefix string
+	clientWebSocket   mesh.NATSWebSocketConfig
+	natsPort          int        // saved for demotion reconnect
+	natsHost          string     // saved for demotion reconnect
+	leafPort          int        // saved for demotion reconnect
+	leafHost          string     // saved for demotion reconnect
+	mu                sync.Mutex // protects role transitions (demotion)
 
 	// Per-tool raw streaming subscriptions (`.stream` subjects). These are
 	// NOT tracked by mesh.Mesh because they bypass NATS micro; the Node owns
@@ -70,11 +79,14 @@ type Node struct {
 
 // Config holds node startup configuration
 type Config struct {
-	NATSUrl       string // explicit NATS URL (skips embed + mDNS)
-	NodeName      string
-	Token         string
-	Username      string
-	Password      string
+	NATSUrl  string // explicit NATS URL (skips embed + mDNS)
+	NodeName string
+	Token    string
+	Username string
+	Password string
+	// InboxPrefix is passed to this node's mesh connection as
+	// mesh.Config.InboxPrefix. Empty keeps the NATS default.
+	InboxPrefix   string
 	Authorization Authorization
 	NATSWebSocket mesh.NATSWebSocketConfig
 	HomeDir       string
@@ -503,18 +515,11 @@ func New(cfg Config) (*Node, error) {
 	n.executor = executor
 
 	// Connect to NATS mesh
-	m, err := mesh.New(mesh.Config{
-		NATSUrl:   cfg.NATSUrl,
-		NodeName:  cfg.NodeName,
-		Token:     cfg.Token,
-		Username:  firstNonEmpty(cfg.Username, authz.InternalUsername),
-		Password:  firstNonEmpty(cfg.Password, authz.InternalPassword),
-		WebSocket: cfg.NATSWebSocket,
-		Logging: mesh.LoggingConfig{
-			Quiet:  cfg.Logging.Quiet,
-			Logger: cfg.Logging.Logger,
-		},
-	})
+	n.nodeName = cfg.NodeName
+	n.token = cfg.Token
+	n.clientUsername, n.clientPassword = cfg.Username, cfg.Password
+	n.clientInboxPrefix, n.clientWebSocket = cfg.InboxPrefix, cfg.NATSWebSocket
+	m, err := mesh.New(n.meshConfig(cfg.NATSUrl, authz.InternalUsername, authz.InternalPassword))
 	if err != nil {
 		n.Close()
 		return nil, fmt.Errorf("failed to join mesh: %w", err)
@@ -1557,6 +1562,28 @@ func schemaToPropertiesMap(props map[string]*config.Schema) map[string]interface
 	return result
 }
 
+// meshConfig is the one place this node's mesh client configuration is built,
+// for its first connection and for the reconnect after a demotion. Token,
+// username, password, inbox prefix and WebSocket settings are the node's
+// configured client identity. internalUsername and internalPassword are the
+// embedded server's own internal credential, used only when no client identity
+// was configured and only against this node's own embedded server.
+func (n *Node) meshConfig(natsURL, internalUsername, internalPassword string) mesh.Config {
+	return mesh.Config{
+		NATSUrl:     natsURL,
+		NodeName:    n.nodeName,
+		Token:       n.token,
+		Username:    firstNonEmpty(n.clientUsername, internalUsername),
+		Password:    firstNonEmpty(n.clientPassword, internalPassword),
+		InboxPrefix: n.clientInboxPrefix,
+		WebSocket:   n.clientWebSocket,
+		Logging: mesh.LoggingConfig{
+			Quiet:  n.logging.Quiet,
+			Logger: n.logging.Logger,
+		},
+	}
+}
+
 // shouldDemote returns true if this node should demote to leaf
 // in favor of the other seed. The older seed (lower StartedAt) wins.
 // If timestamps match, lower alphabetical node name wins.
@@ -1652,15 +1679,11 @@ func (n *Node) demoteToLeaf(seed discovery.Peer) {
 
 	// 4. Reconnect mesh client to the active seed client URL so leaf-published
 	// structured logs/events flow onto the shared mesh instead of staying local-only.
-	m, err := mesh.New(mesh.Config{
-		NATSUrl:  seedClientURL,
-		NodeName: n.nodeName,
-		Token:    n.token,
-		Logging: mesh.LoggingConfig{
-			Quiet:  n.logging.Quiet,
-			Logger: n.logging.Logger,
-		},
-	})
+	// The other seed is a different server: this node's own embedded-server
+	// internal credential means nothing there, so only the configured client
+	// identity is offered. With none configured and typed authorization on
+	// that seed, the connection is refused, which is the fail-closed outcome.
+	m, err := mesh.New(n.meshConfig(seedClientURL, "", ""))
 	if err != nil {
 		n.logf("[node] FATAL: failed to reconnect mesh: %v", err)
 		return
