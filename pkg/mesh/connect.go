@@ -84,6 +84,12 @@ func prepareConnectOptions(cfg Config, extraOpts ...nats.Option) ([]nats.Option,
 		}
 		opts = append(opts, nats.UserInfo(cfg.Username, cfg.Password))
 	}
+	if cfg.InboxPrefix != "" {
+		if err := ValidateInboxPrefix(cfg.InboxPrefix); err != nil {
+			return nil, err
+		}
+		opts = append(opts, nats.CustomInboxPrefix(cfg.InboxPrefix))
+	}
 
 	wsHeaders := cloneHeader(cfg.WebSocket.Headers)
 	if cfg.WebSocket.BearerToken != "" {
@@ -135,4 +141,23 @@ func ParseKeyValuePairs(pairs []string) (map[string][]string, error) {
 		result[key] = append(result[key], value)
 	}
 	return result, nil
+}
+
+// ValidateInboxPrefix reports whether prefix is usable as Config.InboxPrefix: a
+// dot-separated subject of non-empty literal tokens, with no wildcard and no
+// whitespace. A caller that derives the prefix from a principal name should
+// check it here before writing a matching server permission.
+func ValidateInboxPrefix(prefix string) error {
+	if prefix == "" {
+		return fmt.Errorf("NATS inbox prefix is empty")
+	}
+	for _, token := range strings.Split(prefix, ".") {
+		if token == "" {
+			return fmt.Errorf("NATS inbox prefix %q has an empty token", prefix)
+		}
+		if strings.ContainsAny(token, "*> \t\r\n") {
+			return fmt.Errorf("NATS inbox prefix %q must be literal subject tokens", prefix)
+		}
+	}
+	return nil
 }

@@ -75,13 +75,20 @@ func (m *Mesh) SetFileStore(store *filestore.Store) {
 
 // Config holds mesh connection settings
 type Config struct {
-	NATSUrl   string              // NATS server URL (default: nats://localhost:4222)
-	NodeName  string              // Human-readable node name
-	Token     string              // Optional auth token
-	Username  string              // Optional username for typed embedded authorization
-	Password  string              // Optional password for typed embedded authorization
-	WebSocket NATSWebSocketConfig // Optional WebSocket client settings for ws:// or wss:// URLs
-	Logging   LoggingConfig       // Optional lifecycle logging policy
+	NATSUrl  string // NATS server URL (default: nats://localhost:4222)
+	NodeName string // Human-readable node name
+	Token    string // Optional auth token
+	Username string // Optional username for typed embedded authorization
+	Password string // Optional password for typed embedded authorization
+	// InboxPrefix, when set, replaces the default "_INBOX" prefix of every
+	// reply subject this connection creates: plain and context-aware requests,
+	// stream reply inboxes, service discovery and JetStream API replies. A
+	// server that grants a principal subscription only to "<prefix>.>" then
+	// keeps that principal's replies from every other principal. Empty keeps
+	// the NATS default.
+	InboxPrefix string
+	WebSocket   NATSWebSocketConfig // Optional WebSocket client settings for ws:// or wss:// URLs
+	Logging     LoggingConfig       // Optional lifecycle logging policy
 }
 
 // LoggingConfig controls human-readable mesh lifecycle logs.
