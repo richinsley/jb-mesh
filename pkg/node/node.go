@@ -982,6 +982,12 @@ func (n *Node) registerTool(tool *tools.Tool) error {
 				cancel()
 			}
 
+			// A caller is told what failed, not where on this machine it
+			// failed: the traceback stays in the node's own log.
+			err, traceback := publicToolError(err)
+			if traceback != "" {
+				n.logf("[node] %s.%s raised (call %s):\n%s", tool.Name, method, corr, traceback)
+			}
 			data := map[string]any{}
 			if err != nil {
 				data["error"] = err.Error()
@@ -1123,9 +1129,13 @@ func (n *Node) handleStreamRequest(toolName, methodName string, msg *nats.Msg) {
 			Level: "error", Kind: "tool_call", Tool: toolName, Method: methodName, Corr: corr,
 			Duration: time.Since(started), OK: logstore.BoolPtr(false),
 			Message: fmt.Sprintf("%s.%s stream failed at setup", toolName, methodName),
-			Data:    map[string]any{"error": err.Error()},
+			Data:    map[string]any{"error": splitPublic(err)},
 		})
-		n.publishStreamErrorFrame(msg.Reply, err.Error())
+		public, traceback := publicToolError(err)
+		if traceback != "" {
+			n.logf("[node] %s.%s stream raised at setup (call %s):\n%s", toolName, methodName, corr, traceback)
+		}
+		n.publishStreamErrorFrame(msg.Reply, public.Error())
 		return
 	}
 
@@ -1136,6 +1146,9 @@ func (n *Node) handleStreamRequest(toolName, methodName string, msg *nats.Msg) {
 		delete(frame, "request_id")
 		if _, ok := frame["node"]; !ok {
 			frame["node"] = n.nodeName
+		}
+		if traceback := scrubStreamFrame(frame); traceback != "" {
+			n.logf("[node] %s.%s stream raised (call %s):\n%s", toolName, methodName, corr, traceback)
 		}
 		data, mErr := json.Marshal(frame)
 		if mErr != nil {
