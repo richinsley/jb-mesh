@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/richinsley/jb-mesh/pkg/replytoken"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -716,10 +717,10 @@ func (s *Store) StartHealthService(nc *nats.Conn, subject string) (*HealthServic
 		resp, err := json.Marshal(s.Health())
 		if err != nil {
 			fallback, _ := json.Marshal(map[string]any{"ok": false, "error": fmt.Sprintf("marshal health: %v", err)})
-			_ = msg.Respond(fallback)
+			_ = replytoken.Respond(msg, fallback)
 			return
 		}
-		_ = msg.Respond(resp)
+		_ = replytoken.Respond(msg, resp)
 	})
 	if err != nil {
 		return nil, err
@@ -1011,7 +1012,7 @@ func (s *Store) StartQueryServices(nc *nats.Conn) (*QueryService, error) {
 			if err != nil {
 				payload = []byte(`{"ok":false,"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`)
 			}
-			_ = msg.Respond(payload)
+			_ = replytoken.Respond(msg, payload)
 		})
 		if err != nil {
 			qs.Close()

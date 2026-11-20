@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/richinsley/jb-mesh/pkg/replytoken"
 	"log"
 
 	"github.com/nats-io/nats.go"
@@ -530,7 +531,7 @@ func respondJSON(msg *nats.Msg, v interface{}) {
 		log.Printf("[mesh] failed to marshal response: %v", err)
 		return
 	}
-	if err := msg.Respond(data); err != nil {
+	if err := replytoken.Respond(msg, data); err != nil {
 		log.Printf("[mesh] failed to respond: %v", err)
 	}
 }

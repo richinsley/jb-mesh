@@ -10,6 +10,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"fmt"
+	"github.com/richinsley/jb-mesh/pkg/replytoken"
 	"log"
 	"log/slog"
 	"net"
@@ -60,15 +61,16 @@ type Node struct {
 	// reconnect that dropped the credentials would be refused by a seed with
 	// typed authorization, and one that dropped the inbox prefix would have
 	// its reply subscriptions refused by a seed that scopes replies.
-	clientUsername    string
-	clientPassword    string
-	clientInboxPrefix string
-	clientWebSocket   mesh.NATSWebSocketConfig
-	natsPort          int        // saved for demotion reconnect
-	natsHost          string     // saved for demotion reconnect
-	leafPort          int        // saved for demotion reconnect
-	leafHost          string     // saved for demotion reconnect
-	mu                sync.Mutex // protects role transitions (demotion)
+	clientUsername     string
+	clientPassword     string
+	clientInboxPrefix  string
+	clientRequireToken bool
+	clientWebSocket    mesh.NATSWebSocketConfig
+	natsPort           int        // saved for demotion reconnect
+	natsHost           string     // saved for demotion reconnect
+	leafPort           int        // saved for demotion reconnect
+	leafHost           string     // saved for demotion reconnect
+	mu                 sync.Mutex // protects role transitions (demotion)
 
 	// Per-tool raw streaming subscriptions (`.stream` subjects). These are
 	// NOT tracked by mesh.Mesh because they bypass NATS micro; the Node owns
@@ -86,19 +88,22 @@ type Config struct {
 	Password string
 	// InboxPrefix is passed to this node's mesh connection as
 	// mesh.Config.InboxPrefix. Empty keeps the NATS default.
-	InboxPrefix   string
-	Authorization Authorization
-	NATSWebSocket mesh.NATSWebSocketConfig
-	HomeDir       string
-	NoMDNS        bool   // disable mDNS discovery
-	Role          string // "seed", "leaf", or "" (auto-detect via mDNS)
-	LeafURL       string // explicit leaf connection URL (--leaf flag)
-	LeafPort      int    // embedded NATS leaf-node bind port for seed role
-	EmbedHost     string // embedded NATS client bind host; empty preserves jb-mesh default (0.0.0.0)
-	LeafHost      string // embedded NATS leaf-node bind host for seed role; empty preserves jb-mesh default (0.0.0.0)
-	WebsocketHost string // embedded NATS websocket bind host; empty disables websocket
-	WebsocketPort int    // embedded NATS websocket bind port
-	Logging       LoggingConfig
+	InboxPrefix string
+	// RequireReplyToken is passed to this node's mesh connection as
+	// mesh.Config.RequireReplyToken.
+	RequireReplyToken bool
+	Authorization     Authorization
+	NATSWebSocket     mesh.NATSWebSocketConfig
+	HomeDir           string
+	NoMDNS            bool   // disable mDNS discovery
+	Role              string // "seed", "leaf", or "" (auto-detect via mDNS)
+	LeafURL           string // explicit leaf connection URL (--leaf flag)
+	LeafPort          int    // embedded NATS leaf-node bind port for seed role
+	EmbedHost         string // embedded NATS client bind host; empty preserves jb-mesh default (0.0.0.0)
+	LeafHost          string // embedded NATS leaf-node bind host for seed role; empty preserves jb-mesh default (0.0.0.0)
+	WebsocketHost     string // embedded NATS websocket bind host; empty disables websocket
+	WebsocketPort     int    // embedded NATS websocket bind port
+	Logging           LoggingConfig
 	// DisableFileServing retains file-key parameter resolution through the
 	// mesh, but does not register the built-in files service or raw files.*
 	// handlers. Use on clients without authority to serve the Object Store.
@@ -519,6 +524,7 @@ func New(cfg Config) (*Node, error) {
 	n.token = cfg.Token
 	n.clientUsername, n.clientPassword = cfg.Username, cfg.Password
 	n.clientInboxPrefix, n.clientWebSocket = cfg.InboxPrefix, cfg.NATSWebSocket
+	n.clientRequireToken = cfg.RequireReplyToken
 	m, err := mesh.New(n.meshConfig(cfg.NATSUrl, authz.InternalUsername, authz.InternalPassword))
 	if err != nil {
 		n.Close()
@@ -1092,7 +1098,7 @@ func (n *Node) handleStreamRequest(toolName, methodName string, msg *nats.Msg) {
 	var req mesh.CallRequest
 	if len(msg.Data) > 0 {
 		if err := json.Unmarshal(msg.Data, &req); err != nil {
-			n.publishStreamErrorFrame(msg.Reply, fmt.Sprintf("invalid request: %v", err))
+			n.publishStreamErrorFrame(msg, fmt.Sprintf("invalid request: %v", err))
 			return
 		}
 	}
@@ -1135,7 +1141,7 @@ func (n *Node) handleStreamRequest(toolName, methodName string, msg *nats.Msg) {
 		if traceback != "" {
 			n.logf("[node] %s.%s stream raised at setup (call %s):\n%s", toolName, methodName, corr, traceback)
 		}
-		n.publishStreamErrorFrame(msg.Reply, public.Error())
+		n.publishStreamErrorFrame(msg, public.Error())
 		return
 	}
 
@@ -1155,7 +1161,9 @@ func (n *Node) handleStreamRequest(toolName, methodName string, msg *nats.Msg) {
 			n.logf("[node] stream frame marshal for %s.%s: %v", toolName, methodName, mErr)
 			continue
 		}
-		if pubErr := n.mesh.Conn().Publish(msg.Reply, data); pubErr != nil {
+		// Every frame carries the request's reply token, so the caller can
+		// tell this stream's frames from anything else sent to its reply subject.
+		if pubErr := replytoken.Publish(n.mesh.Conn(), msg, data); pubErr != nil {
 			n.logf("[node] stream frame publish for %s.%s: %v", toolName, methodName, pubErr)
 			streamErr = pubErr
 			break
@@ -1184,8 +1192,8 @@ func ctxErrString(ctx context.Context) string {
 	return ""
 }
 
-func (n *Node) publishStreamErrorFrame(replyInbox, errMsg string) {
-	if replyInbox == "" {
+func (n *Node) publishStreamErrorFrame(req *nats.Msg, errMsg string) {
+	if req == nil || req.Reply == "" {
 		return
 	}
 	frame := mesh.StreamFrame{Error: errMsg, Done: true, Node: n.nodeName}
@@ -1194,7 +1202,7 @@ func (n *Node) publishStreamErrorFrame(replyInbox, errMsg string) {
 		n.logf("[node] stream error-frame marshal: %v", err)
 		return
 	}
-	if pubErr := n.mesh.Conn().Publish(replyInbox, data); pubErr != nil {
+	if pubErr := replytoken.Publish(n.mesh.Conn(), req, data); pubErr != nil {
 		n.logf("[node] stream error-frame publish: %v", pubErr)
 	}
 }
@@ -1588,8 +1596,8 @@ func (n *Node) meshConfig(natsURL, internalUsername, internalPassword string) me
 		Token:       n.token,
 		Username:    firstNonEmpty(n.clientUsername, internalUsername),
 		Password:    firstNonEmpty(n.clientPassword, internalPassword),
-		InboxPrefix: n.clientInboxPrefix,
-		WebSocket:   n.clientWebSocket,
+		InboxPrefix: n.clientInboxPrefix, RequireReplyToken: n.clientRequireToken,
+		WebSocket: n.clientWebSocket,
 		Logging: mesh.LoggingConfig{
 			Quiet:  n.logging.Quiet,
 			Logger: n.logging.Logger,
