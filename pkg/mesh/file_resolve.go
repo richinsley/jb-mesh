@@ -1,13 +1,16 @@
 package mesh
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/richinsley/jb-mesh/pkg/replytoken"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -90,7 +93,7 @@ func ResolveFileParams(params map[string]interface{}, store *filestore.Store, nc
 			// Local store miss — try NATS files.get (reaches seed node)
 			log.Printf("[mesh] file resolve: %s=%q not in local store, trying NATS files.get", key, strVal)
 			reqData, _ := json.Marshal(map[string]string{"key": strVal})
-			msg, natsErr := nc[0].Request("files.get", reqData, 30*time.Second)
+			msg, natsErr := requestFile(nc[0], reqData)
 			if natsErr == nil {
 				var resp fileGetResponse
 				if json.Unmarshal(msg.Data, &resp) == nil && resp.OK {
@@ -149,4 +152,18 @@ func ResolveFileParams(params map[string]interface{}, store *filestore.Store, nc
 		}
 	}
 	return cleanup, nil
+}
+
+// fileRequesters holds, per connection, the requester a mesh registered for
+// it, so a file request made while resolving a call's parameters follows that
+// connection's reply-token rule.
+var fileRequesters sync.Map // *nats.Conn -> *replytoken.Requester
+
+func requestFile(nc *nats.Conn, reqData []byte) (*nats.Msg, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if r, ok := fileRequesters.Load(nc); ok {
+		return r.(*replytoken.Requester).Request(ctx, "files.get", reqData)
+	}
+	return (&replytoken.Requester{NC: nc}).Request(ctx, "files.get", reqData)
 }
