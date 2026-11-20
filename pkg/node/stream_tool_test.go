@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,6 +93,10 @@ rpc:
     count:
       description: Emit one chunk per number, then return the sum
       stream: true
+    wait:
+      description: Wait in small steps until done or cancelled
+    last_wait:
+      description: Report how the last wait ended
     bus_probe:
       description: Try to reach the bus with what the node gave this process
     health:
@@ -113,11 +118,31 @@ class Counter(MessagePackService):
     def count(self, upto: int = 5, pause_ms: int = 100, ctx=None) -> dict:
         total = 0
         for n in range(1, int(upto) + 1):
+            if ctx is not None and ctx.cancelled:
+                break
             total += n
             if ctx is not None:
                 ctx.emit({"n": n})
             time.sleep(int(pause_ms) / 1000.0)
         return {"sum": total}
+
+    @method
+    async def wait(self, steps: int = 100, ctx=None) -> dict:
+        # Async, so the service keeps handling messages (the cancel among
+        # them) while this waits. Cancellation is cooperative: it polls.
+        self._last_wait = {"running": True, "steps": 0, "cancelled": False}
+        for n in range(int(steps)):
+            if ctx is not None and ctx.cancelled:
+                self._last_wait = {"running": False, "steps": n, "cancelled": True}
+                return self._last_wait
+            await asyncio.sleep(0.05)
+            self._last_wait["steps"] = n + 1
+        self._last_wait = {"running": False, "steps": int(steps), "cancelled": False}
+        return self._last_wait
+
+    @method
+    def last_wait(self) -> dict:
+        return dict(getattr(self, "_last_wait", {"running": False, "steps": -1, "cancelled": False}))
 
     @method
     def bus_probe(self) -> dict:
@@ -272,6 +297,135 @@ if __name__ == "__main__":
 		}
 		if without != 2 || with < 6 {
 			t.Fatalf("on the wire: %d frames with the token, %d without; want at least 6 and exactly 2", with, without)
+		}
+	})
+
+	// callIDs hands the test the call id of each request to the given
+	// subject, as another principal who can see the request would learn it.
+	callIDs := func(subject string) <-chan string {
+		t.Helper()
+		ch := make(chan string, 4)
+		if _, err := mallory.Subscribe(subject, func(m *nats.Msg) {
+			var req mesh.CallRequest
+			if json.Unmarshal(m.Data, &req) == nil && req.CallID != "" {
+				ch <- req.CallID
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := mallory.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		return ch
+	}
+	lastWait := func() map[string]interface{} {
+		t.Helper()
+		res, err := client.Call("counter", "last_wait", nil, 10*time.Second, "leaf-a")
+		if err != nil || !res.OK {
+			t.Fatalf("last_wait: %+v %v", res, err)
+		}
+		out, _ := res.Result.(map[string]interface{})
+		return out
+	}
+
+	t.Run("only the requester can cancel an ordinary call", func(t *testing.T) {
+		ids := callIDs("node.leaf-a.tools.counter.wait")
+		before := leaf.IgnoredCancels()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := client.CallWithContext(ctx, "counter", "wait", map[string]interface{}{"steps": 200}, "leaf-a")
+			done <- err
+		}()
+		callID := <-ids
+		// Another principal knows the live call id and tells the node to
+		// stop: with nothing, and with a made-up proof. (It waits a moment
+		// first: it saw the request as soon as the node did, and the node's
+		// cancel subscription has to reach the server before a cancel can
+		// find it.)
+		time.Sleep(200 * time.Millisecond)
+		subject := mesh.CancelSubject(callID)
+		for _, msg := range []*nats.Msg{{Subject: subject}, {Subject: subject, Header: nats.Header{replytoken.CancelHeader: []string{strings.Repeat("ab", 32)}}}} {
+			if err := mallory.PublishMsg(msg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = mallory.Flush()
+		time.Sleep(500 * time.Millisecond)
+		select {
+		case err := <-done:
+			t.Fatalf("the call ended after another principal's cancel: %v", err)
+		default:
+		}
+		if got := leaf.IgnoredCancels() - before; got != 2 {
+			t.Fatalf("the node ignored %d cancel(s), want 2", got)
+		}
+		// The requester cancels. Its call returns, and the tool itself stops.
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("the requester's cancelled call returned %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the requester's call did not return after its own cancel")
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			last := lastWait()
+			if last["cancelled"] == true {
+				if steps, _ := last["steps"].(float64); steps >= 200 || steps < 5 {
+					t.Fatalf("the tool reports %v", last)
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the tool never saw the requester's cancel: %v", last)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if got := leaf.IgnoredCancels() - before; got != 2 {
+			t.Fatalf("the requester's cancel was counted as ignored (%d)", got)
+		}
+	})
+
+	t.Run("only the requester can cancel a stream", func(t *testing.T) {
+		ids := callIDs(mesh.NodeStreamSubject("leaf-a", "counter", "count"))
+		before := leaf.IgnoredCancels()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		frames, err := client.Stream(ctx, "counter", "count", map[string]interface{}{"upto": 80, "pause_ms": 100}, "leaf-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-replies // the earlier subscription on this subject also fires
+		callID := <-ids
+		got := 0
+		interfered := false
+		for f := range frames {
+			if f.Done {
+				t.Fatalf("the stream ran to its end (%d frames); the requester's cancel did not stop it", got)
+			}
+			got++
+			if got == 3 && !interfered {
+				interfered = true
+				if err := mallory.Publish(mesh.CancelSubject(callID), nil); err != nil {
+					t.Fatal(err)
+				}
+				_ = mallory.Flush()
+			}
+			// The stream is still running well after the other principal's
+			// cancel; then the requester stops it.
+			if got == 12 {
+				if n := leaf.IgnoredCancels() - before; n != 1 {
+					t.Fatalf("the node ignored %d cancel(s) by frame 12, want 1", n)
+				}
+				cancel()
+			}
+		}
+		if got < 12 || got >= 80 {
+			t.Fatalf("the stream delivered %d frames; want it to pass the other principal's cancel and stop at the requester's", got)
 		}
 	})
 

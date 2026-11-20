@@ -236,6 +236,11 @@ type CallRequest struct {
 	// `cancel.<CallID>` and the serving node subscribes to that subject for the
 	// duration of the call. Empty for non-cancellable calls.
 	CallID string `json:"call_id,omitempty"`
+
+	// ReplyToken is the reply token the request arrived with, set by the
+	// serving node from the message header and never sent in the body. A
+	// handler uses it to check a cancel for this call (replytoken.ValidCancel).
+	ReplyToken string `json:"-"`
 }
 
 // CancelSubject returns the NATS subject a caller publishes to in order to
@@ -357,6 +362,7 @@ func (m *Mesh) registerToolLocked(toolName, version, description string, methods
 			if callReq.Params == nil {
 				callReq.Params = make(map[string]interface{})
 			}
+			callReq.ReplyToken = req.Headers().Get(replytoken.Header)
 
 			// Resolve file store keys to temp files for known file params
 			if m.fileStore != nil {
@@ -404,6 +410,7 @@ func (m *Mesh) registerToolLocked(toolName, version, description string, methods
 			if callReq.Params == nil {
 				callReq.Params = make(map[string]interface{})
 			}
+			callReq.ReplyToken = replytoken.Of(msg)
 
 			// Resolve file store keys to temp files for known file params
 			if m.fileStore != nil {
@@ -503,15 +510,19 @@ func (m *Mesh) CallWithContext(ctx context.Context, toolName, method string, par
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// The call's reply token is made here, not inside the requester, because
+	// a cancel for this call has to prove knowledge of it.
+	token, err := replytoken.New()
+	if err != nil {
+		return nil, err
+	}
 	// The requester handles the reply subscription and respects ctx.Done().
-	msg, err := m.requester.Request(ctx, subject, reqData)
+	msg, err := m.requester.RequestToken(ctx, subject, reqData, token)
 	if err != nil {
 		// On ctx cancellation, best-effort publish the cancel signal so the
 		// serving node can propagate to jumpboot. We don't wait for an ack.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			if pubErr := m.nc.Publish(CancelSubject(callID), nil); pubErr != nil {
-				m.logf("[mesh] CallWithContext: cancel publish for %s failed: %v", callID, pubErr)
-			}
+			m.publishCancel("CallWithContext", callID, token)
 			return nil, ctxErr
 		}
 		return nil, fmt.Errorf("call to %s failed: %w", subject, err)
@@ -566,7 +577,11 @@ func (m *Mesh) Stream(ctx context.Context, toolName, method string, params map[s
 	// headroom if our consumer briefly stalls; beyond that we accept NATS'
 	// slow-consumer behavior. With RequireReplyToken set it delivers only
 	// frames that carry this call's token.
-	stream, err := m.requester.OpenStream(ctx, subject, reqData, 32, func(msg *nats.Msg) bool {
+	token, err := replytoken.New()
+	if err != nil {
+		return nil, err
+	}
+	stream, err := m.requester.OpenStreamToken(ctx, subject, reqData, token, 32, func(msg *nats.Msg) bool {
 		var frame StreamFrame
 		return json.Unmarshal(msg.Data, &frame) != nil || frame.Done
 	})
@@ -582,9 +597,7 @@ func (m *Mesh) Stream(ctx context.Context, toolName, method string, params map[s
 		// if nothing valid ever arrived although something did, say so in
 		// place of a channel that just closes.
 		ended := func() {
-			if pubErr := m.nc.Publish(CancelSubject(callID), nil); pubErr != nil {
-				m.logf("[mesh] Stream: cancel publish for %s failed: %v", callID, pubErr)
-			}
+			m.publishCancel("Stream", callID, token)
 			if n := stream.Rejected(); n > 0 && !delivered {
 				select {
 				case out <- StreamFrame{Error: fmt.Sprintf("stream %s: %v; %d message(s) arrived on its reply subject without this request's reply token and were rejected", subject, ctx.Err(), n), Done: true}:
@@ -637,6 +650,15 @@ func microEcho(req micro.Request) []micro.RespondOpt {
 		return nil
 	}
 	return []micro.RespondOpt{micro.WithHeaders(micro.Headers{replytoken.Header: []string{token}})}
+}
+
+// publishCancel tells the serving node to stop a call. The message carries a
+// proof made from the call's reply token, so the node can tell this cancel
+// from one sent by somebody who only knows the call id.
+func (m *Mesh) publishCancel(what, callID, token string) {
+	if pubErr := m.nc.PublishMsg(replytoken.CancelMessage(CancelSubject(callID), token, callID)); pubErr != nil {
+		m.logf("[mesh] %s: cancel publish for %s failed: %v", what, callID, pubErr)
+	}
 }
 
 func extractCorr(params map[string]interface{}) (string, bool) {
