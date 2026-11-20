@@ -85,6 +85,12 @@ func (r *Requester) Request(ctx context.Context, subject string, data []byte) (*
 	if err != nil {
 		return nil, err
 	}
+	return r.RequestToken(ctx, subject, data, token)
+}
+
+// RequestToken is Request with a token the caller made (New), for a caller
+// that needs the token afterwards, for instance to prove a cancel.
+func (r *Requester) RequestToken(ctx context.Context, subject string, data []byte, token string) (*nats.Msg, error) {
 	req := &nats.Msg{Subject: subject, Data: data, Header: EchoToken(token)}
 	if !r.Require {
 		return r.NC.RequestMsgWithContext(ctx, req)
@@ -144,6 +150,11 @@ func (r *Requester) OpenStream(ctx context.Context, subject string, data []byte,
 	if err != nil {
 		return nil, err
 	}
+	return r.OpenStreamToken(ctx, subject, data, token, buffer, done)
+}
+
+// OpenStreamToken is OpenStream with a token the caller made (New).
+func (r *Requester) OpenStreamToken(ctx context.Context, subject string, data []byte, token string, buffer int, done func(*nats.Msg) bool) (*Stream, error) {
 	req := &nats.Msg{Subject: subject, Data: data, Header: EchoToken(token), Reply: r.NC.NewRespInbox()}
 	if buffer < 1 {
 		buffer = 1

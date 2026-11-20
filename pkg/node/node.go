@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
@@ -65,6 +66,8 @@ type Node struct {
 	clientPassword     string
 	clientInboxPrefix  string
 	clientRequireToken bool
+	requireCancelProof bool
+	ignoredCancels     atomic.Uint64
 	clientWebSocket    mesh.NATSWebSocketConfig
 	natsPort           int        // saved for demotion reconnect
 	natsHost           string     // saved for demotion reconnect
@@ -92,18 +95,24 @@ type Config struct {
 	// RequireReplyToken is passed to this node's mesh connection as
 	// mesh.Config.RequireReplyToken.
 	RequireReplyToken bool
-	Authorization     Authorization
-	NATSWebSocket     mesh.NATSWebSocketConfig
-	HomeDir           string
-	NoMDNS            bool   // disable mDNS discovery
-	Role              string // "seed", "leaf", or "" (auto-detect via mDNS)
-	LeafURL           string // explicit leaf connection URL (--leaf flag)
-	LeafPort          int    // embedded NATS leaf-node bind port for seed role
-	EmbedHost         string // embedded NATS client bind host; empty preserves jb-mesh default (0.0.0.0)
-	LeafHost          string // embedded NATS leaf-node bind host for seed role; empty preserves jb-mesh default (0.0.0.0)
-	WebsocketHost     string // embedded NATS websocket bind host; empty disables websocket
-	WebsocketPort     int    // embedded NATS websocket bind port
-	Logging           LoggingConfig
+	// RequireCancelProof makes a call that arrived without a reply token
+	// impossible to cancel remotely. A call that arrived with one is always
+	// cancelled only by a cancel carrying its proof (replytoken.CancelProof),
+	// whatever this is set to. Set it where anyone on the mesh may publish a
+	// cancel and callers are expected to send reply tokens.
+	RequireCancelProof bool
+	Authorization      Authorization
+	NATSWebSocket      mesh.NATSWebSocketConfig
+	HomeDir            string
+	NoMDNS             bool   // disable mDNS discovery
+	Role               string // "seed", "leaf", or "" (auto-detect via mDNS)
+	LeafURL            string // explicit leaf connection URL (--leaf flag)
+	LeafPort           int    // embedded NATS leaf-node bind port for seed role
+	EmbedHost          string // embedded NATS client bind host; empty preserves jb-mesh default (0.0.0.0)
+	LeafHost           string // embedded NATS leaf-node bind host for seed role; empty preserves jb-mesh default (0.0.0.0)
+	WebsocketHost      string // embedded NATS websocket bind host; empty disables websocket
+	WebsocketPort      int    // embedded NATS websocket bind port
+	Logging            LoggingConfig
 	// DisableFileServing retains file-key parameter resolution through the
 	// mesh, but does not register the built-in files service or raw files.*
 	// handlers. Use on clients without authority to serve the Object Store.
@@ -525,6 +534,7 @@ func New(cfg Config) (*Node, error) {
 	n.clientUsername, n.clientPassword = cfg.Username, cfg.Password
 	n.clientInboxPrefix, n.clientWebSocket = cfg.InboxPrefix, cfg.NATSWebSocket
 	n.clientRequireToken = cfg.RequireReplyToken
+	n.requireCancelProof = cfg.RequireCancelProof
 	m, err := mesh.New(n.meshConfig(cfg.NATSUrl, authz.InternalUsername, authz.InternalPassword))
 	if err != nil {
 		n.Close()
@@ -974,9 +984,7 @@ func (n *Node) registerTool(tool *tools.Tool) error {
 				// duration. When a cancel arrives, we cancel a context that the
 				// executor threads down to jumpboot's QueueProcess.CallContext.
 				ctx, cancel := context.WithCancel(context.Background())
-				sub, subErr := n.mesh.Conn().Subscribe(mesh.CancelSubject(cancelID), func(_ *nats.Msg) {
-					cancel()
-				})
+				sub, subErr := n.subscribeCancel(cancelID, req.ReplyToken, tool.Name, method, corr, cancel)
 				if subErr != nil {
 					n.logf("[node] cancel-subject subscribe failed for %s: %v", cancelID, subErr)
 					// Continue without cancellation rather than failing the call.
@@ -1087,6 +1095,45 @@ func (n *Node) unregisterStreamingSubjects(toolName string) {
 	}
 }
 
+// subscribeCancel listens for the cancel of one call and stops it only for a
+// cancel its requester could have sent.
+//
+// A cancel arrives on a subject named for the call id, and anyone who may
+// publish there and knows the id can send one. So when the call carried a
+// reply token, a cancel must carry the proof made from that token and the
+// call id (replytoken.CancelProof); anything else is ignored and counted.
+//
+// A call that carried no token has nothing to check a cancel against. By
+// default such a call is cancelled by any message, as it always was. With
+// RequireCancelProof it cannot be cancelled remotely at all, which is the
+// only safe reading when anyone on the mesh may publish a cancel.
+func (n *Node) subscribeCancel(callID, token, tool, method, corr string, cancel func()) (*nats.Subscription, error) {
+	return n.mesh.Conn().Subscribe(mesh.CancelSubject(callID), func(msg *nats.Msg) {
+		switch {
+		case token != "" && replytoken.ValidCancel(msg, token, callID):
+			cancel()
+		case token == "" && !n.requireCancelProof:
+			cancel()
+		default:
+			why := "it carried no valid proof for this call"
+			if token == "" {
+				why = "the call carried no reply token, so no cancel can be checked against it"
+			}
+			n.ignoredCancels.Add(1)
+			n.logf("[node] ignored a cancel for %s.%s (call %s): %s", tool, method, corr, why)
+			logstore.BestEffortPublish(n.logProducer, logstore.PublishOptions{
+				Level: "warn", Kind: "tool_call", Tool: tool, Method: method, Corr: corr,
+				Message: fmt.Sprintf("%s.%s: a cancel was ignored: %s", tool, method, why),
+				Data:    map[string]any{"cancel_ignored": true},
+			})
+		}
+	})
+}
+
+// IgnoredCancels is how many cancel messages this node has ignored because
+// they did not carry a valid proof for the call they named.
+func (n *Node) IgnoredCancels() uint64 { return n.ignoredCancels.Load() }
+
 // handleStreamRequest is the raw NATS handler invoked for streaming tool
 // calls. It pumps frames from executor.CallStream to the caller's reply
 // inbox, marking the terminal frame with done=true. The call's context is
@@ -1119,9 +1166,7 @@ func (n *Node) handleStreamRequest(toolName, methodName string, msg *nats.Msg) {
 
 	// Per-call cancel subscription (same pattern as single-reply path).
 	if callID != "" {
-		cancelSub, err := n.mesh.Conn().Subscribe(mesh.CancelSubject(callID), func(_ *nats.Msg) {
-			cancel()
-		})
+		cancelSub, err := n.subscribeCancel(callID, replytoken.Of(msg), toolName, methodName, corr, cancel)
 		if err != nil {
 			n.logf("[node] stream cancel-sub for %s failed: %v", callID, err)
 		} else {
