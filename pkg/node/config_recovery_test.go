@@ -23,7 +23,9 @@ import (
 //     service, not its node-targeted subjects, not its streaming subjects,
 //     and a reconnect restores none of them;
 //   - a recovery that succeeds leaves it with exactly one of each, before and
-//     after a reconnect: one answer per request and each stream frame once.
+//     after a reconnect: one answer per request and each stream frame once;
+//   - a running tool whose restart for a new configuration fails is left
+//     with no route, the same way.
 func TestStoppedToolThroughConfigRecoveryAndReconnect(t *testing.T) {
 	if os.Getenv("JB_MESH_SKIP_INTEGRATION") == "1" {
 		t.Skip("skipping integration test (JB_MESH_SKIP_INTEGRATION=1)")
@@ -292,4 +294,27 @@ if __name__ == "__main__":
 	reconnect()
 	waitUp()
 	oneOfEach("after a second recovery and a reconnect")
+
+	// A running tool whose restart for a new configuration fails keeps no
+	// route either, and a later valid set brings it back.
+	if err := os.Rename(entrypoint, hidden); err != nil {
+		t.Fatal(err)
+	}
+	if err := set("/e"); err == nil || !strings.Contains(err.Error(), "failed to restart after config change") {
+		t.Fatalf("a restart with no entrypoint: got %v", err)
+	}
+	noRoutes("after a failed restart of a running tool")
+	reconnect()
+	noRoutes("after a failed restart of a running tool and a reconnect")
+	if err := os.Rename(hidden, entrypoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := set("/f"); err != nil {
+		t.Fatalf("recovery after a failed restart: %v", err)
+	}
+	waitUp()
+	oneOfEach("after recovering from a failed restart")
+	reconnect()
+	waitUp()
+	oneOfEach("after recovering from a failed restart, and a reconnect")
 }

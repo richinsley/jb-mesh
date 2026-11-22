@@ -1354,6 +1354,8 @@ func (n *Node) HandleConfig(toolName, action string, values map[string]interface
 					return nil, fmt.Errorf("failed to stop for config reload: %w", err)
 				}
 				if err := n.executor.Start(toolName); err != nil {
+					// It was stopped and did not come back: it keeps no route.
+					n.withdrawTool(toolName)
 					return nil, fmt.Errorf("failed to restart after config change: %w", err)
 				}
 			} else {
