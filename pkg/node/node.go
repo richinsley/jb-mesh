@@ -1311,6 +1311,14 @@ func (n *Node) InspectRelease(toolName string) (*tools.ReleaseInspection, error)
 	return n.manager.InspectRelease(toolName)
 }
 
+// withdrawTool removes everything that routes calls to a tool on this node:
+// its mesh registration (with the copy kept for a reconnect) and the
+// streaming subscriptions the node owns for it.
+func (n *Node) withdrawTool(toolName string) {
+	n.mesh.UnregisterTool(toolName)
+	n.unregisterStreamingSubjects(toolName)
+}
+
 // HandleConfig handles get/set config requests for a tool.
 func (n *Node) HandleConfig(toolName, action string, values map[string]interface{}) (map[string]interface{}, error) {
 	tool, ok := n.manager.Get(toolName)
@@ -1350,8 +1358,13 @@ func (n *Node) HandleConfig(toolName, action string, values map[string]interface
 				}
 			} else {
 				n.logf("[node] config changed for tool %s, which is not running — starting", toolName)
-				n.mesh.UnregisterTool(toolName)
+				// Whatever an earlier registration left is withdrawn first,
+				// and again if this one fails: a tool that did not come up
+				// has no route, now or after a reconnect.
+				n.withdrawTool(toolName)
 				if err := n.registerTool(tool); err != nil {
+					n.withdrawTool(toolName)
+					_ = n.executor.Stop(toolName)
 					return nil, fmt.Errorf("config saved, but the tool did not start: %w", err)
 				}
 			}
@@ -1404,7 +1417,7 @@ func (n *Node) UpdateTool(toolName string, clean bool) (string, string, error) {
 
 	// Unregister old version from mesh
 	n.logf("[node] UpdateTool unregistering %s from mesh", toolName)
-	n.mesh.UnregisterTool(toolName)
+	n.withdrawTool(toolName)
 
 	// Update the tool
 	n.logf("[node] UpdateTool reloading manifest/packages for %s", toolName)

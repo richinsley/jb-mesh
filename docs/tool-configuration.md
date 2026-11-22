@@ -43,6 +43,8 @@ Up to v0.1.6 the error was discarded and the tool was started with no `JB_TOOL_C
 
 To bring a refused tool up, set a valid configuration. Setting the configuration of a persistent tool restarts it if it is running, and starts and registers it if it is not.
 
+If that start fails for another reason, the tool is left with no route on the mesh: its service, its node-targeted subjects and its streaming subjects are all withdrawn, and a reconnect does not restore them.
+
 Two cases to expect:
 
 - **A persistent tool with a required key and no default** is refused when first installed. Set its configuration and it starts.

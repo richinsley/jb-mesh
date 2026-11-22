@@ -307,13 +307,24 @@ func (m *Mesh) RegisterTool(toolName, version, description string, methods []str
 	if len(methodSchemas) > 0 {
 		schemas = methodSchemas[0]
 	}
-	return m.registerToolLocked(toolName, version, description, methods, schemas, handler, true)
+	err := m.registerToolLocked(toolName, version, description, methods, schemas, handler, true)
+	if err != nil {
+		// A registration that failed part-way leaves nothing behind: no
+		// node-targeted subscription for the methods that were reached, and
+		// nothing for a reconnect to restore.
+		m.forgetRegistrationLocked(toolName)
+		m.dropNodeSubsLocked(toolName)
+	}
+	return err
 }
 
 // registerToolLocked does the actual registration work. Must be called with m.mu held.
 // If save is true, the registration is saved for reconnect re-registration.
 func (m *Mesh) registerToolLocked(toolName, version, description string, methods []string, methodSchemas map[string]MethodSchema, handler ToolHandler, save bool) error {
 	if save {
+		// One saved registration per tool: registering a tool again replaces
+		// what a reconnect would restore instead of adding to it.
+		m.forgetRegistrationLocked(toolName)
 		m.registrations = append(m.registrations, toolRegistration{
 			name:          toolName,
 			version:       version,
@@ -801,11 +812,44 @@ func (m *Mesh) reRegisterTools() {
 	m.logf("[mesh] reconnect re-registration complete")
 }
 
-// UnregisterTool removes a tool's service registration from the mesh.
-// Returns true if the tool was found and removed, false if not found.
+// forgetRegistrationLocked drops the registration saved for toolName, so a
+// reconnect does not restore it. Must be called with m.mu held.
+func (m *Mesh) forgetRegistrationLocked(toolName string) {
+	kept := m.registrations[:0]
+	for _, reg := range m.registrations {
+		if reg.name != toolName {
+			kept = append(kept, reg)
+		}
+	}
+	for i := len(kept); i < len(m.registrations); i++ {
+		m.registrations[i] = toolRegistration{} // release the handler
+	}
+	m.registrations = kept
+}
+
+// dropNodeSubsLocked unsubscribes the node-targeted subscriptions of
+// toolName's methods. Must be called with m.mu held.
+func (m *Mesh) dropNodeSubsLocked(toolName string) {
+	prefix := fmt.Sprintf("node.%s.tools.%s.", m.nodeName, toolName)
+	remaining := m.nodeSubs[:0]
+	for _, sub := range m.nodeSubs {
+		if strings.HasPrefix(sub.Subject, prefix) {
+			sub.Unsubscribe()
+		} else {
+			remaining = append(remaining, sub)
+		}
+	}
+	m.nodeSubs = remaining
+}
+
+// UnregisterTool removes a tool's service registration from the mesh, and
+// the registration saved for it, so a reconnect does not bring the tool
+// back. Returns true if the tool was found and removed, false if not found.
 func (m *Mesh) UnregisterTool(toolName string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	m.forgetRegistrationLocked(toolName)
 
 	found := false
 	for i, svc := range m.services {
@@ -818,17 +862,7 @@ func (m *Mesh) UnregisterTool(toolName string) bool {
 		}
 	}
 
-	// Also unsubscribe node-targeted subscriptions for this tool
-	prefix := fmt.Sprintf("node.%s.tools.%s.", m.nodeName, toolName)
-	remaining := m.nodeSubs[:0]
-	for _, sub := range m.nodeSubs {
-		if sub.Subject == "" || len(sub.Subject) < len(prefix) || sub.Subject[:len(prefix)] != prefix {
-			remaining = append(remaining, sub)
-		} else {
-			sub.Unsubscribe()
-		}
-	}
-	m.nodeSubs = remaining
+	m.dropNodeSubsLocked(toolName)
 
 	return found
 }
