@@ -16,6 +16,10 @@
 //
 // What that proves is possession of the token. It does not prove which
 // process produced a reply.
+//
+// The same token lets a requester prove that a cancel for its call is its
+// own, without putting the token on the cancel subject: see CancelProof,
+// CancelMessage and ValidCancel.
 package replytoken
 
 import (

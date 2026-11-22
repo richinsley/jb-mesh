@@ -233,8 +233,9 @@ type CallRequest struct {
 
 	// CallID, if set, identifies this call for cancellation routing. When the
 	// caller's context fires, it publishes an empty message to
-	// `cancel.<CallID>` and the serving node subscribes to that subject for the
-	// duration of the call. Empty for non-cancellable calls.
+	// `cancel.<CallID>`, carrying the call's cancel proof
+	// (replytoken.CancelMessage), and the serving node subscribes to that
+	// subject for the duration of the call. Empty for non-cancellable calls.
 	CallID string `json:"call_id,omitempty"`
 
 	// ReplyToken is the reply token the request arrived with, set by the
@@ -246,6 +247,12 @@ type CallRequest struct {
 // CancelSubject returns the NATS subject a caller publishes to in order to
 // signal cancellation of a specific in-flight call. The serving node
 // subscribes to the same subject for the call's lifetime.
+//
+// The subject alone is not enough. A call that carried a reply token is
+// cancelled only by a message that also carries its proof, so build the
+// message with replytoken.CancelMessage; a bare publish here is ignored and
+// counted by the node. A call that carried no token is cancelled by any
+// message, unless the node sets RequireCancelProof, and then by none.
 func CancelSubject(callID string) string {
 	return "cancel." + callID
 }
@@ -300,13 +307,24 @@ func (m *Mesh) RegisterTool(toolName, version, description string, methods []str
 	if len(methodSchemas) > 0 {
 		schemas = methodSchemas[0]
 	}
-	return m.registerToolLocked(toolName, version, description, methods, schemas, handler, true)
+	err := m.registerToolLocked(toolName, version, description, methods, schemas, handler, true)
+	if err != nil {
+		// A registration that failed part-way leaves nothing behind: no
+		// node-targeted subscription for the methods that were reached, and
+		// nothing for a reconnect to restore.
+		m.forgetRegistrationLocked(toolName)
+		m.dropNodeSubsLocked(toolName)
+	}
+	return err
 }
 
 // registerToolLocked does the actual registration work. Must be called with m.mu held.
 // If save is true, the registration is saved for reconnect re-registration.
 func (m *Mesh) registerToolLocked(toolName, version, description string, methods []string, methodSchemas map[string]MethodSchema, handler ToolHandler, save bool) error {
 	if save {
+		// One saved registration per tool: registering a tool again replaces
+		// what a reconnect would restore instead of adding to it.
+		m.forgetRegistrationLocked(toolName)
 		m.registrations = append(m.registrations, toolRegistration{
 			name:          toolName,
 			version:       version,
@@ -477,8 +495,9 @@ func (m *Mesh) Call(toolName, method string, params map[string]interface{}, time
 }
 
 // CallWithContext is like Call but propagates ctx cancellation to the serving
-// node via a NATS publish to `cancel.<call_id>`. The serving node subscribes
-// to that subject for the call's duration and forwards the signal to its
+// node via a NATS publish to `cancel.<call_id>`, carrying the proof made from
+// this call's reply token. The serving node subscribes to that subject for
+// the call's duration and forwards a cancel that passes its check to its
 // jumpboot tool process (where a cooperatively-cancellable method can stop
 // early).
 //
@@ -487,9 +506,6 @@ func (m *Mesh) Call(toolName, method string, params map[string]interface{}, time
 // after best-effort publishing the cancel signal — it does not wait for the
 // server to acknowledge cancellation. Callers needing a hard deadline should
 // derive ctx with context.WithTimeout.
-//
-// Part of Phase 1 of the streaming+cancellation design — see
-// the streaming and cancellation design.
 func (m *Mesh) CallWithContext(ctx context.Context, toolName, method string, params map[string]interface{}, targetNode ...string) (*CallResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -544,11 +560,13 @@ func (m *Mesh) CallWithContext(ctx context.Context, toolName, method string, par
 // subject (or its node-targeted variant when targetNode is set), which the
 // serving node only registers for methods declared with `stream: true` in
 // their manifest. Calls to non-streaming methods on the stream subject get
-// no responder.
+// no responder: the stream ends at once with an error frame, or, with
+// RequireReplyToken set, only when ctx ends, because the server's "no
+// responders" status carries no token.
 //
 // On ctx.Done, Stream publishes to `cancel.<call_id>` so the serving node
-// can propagate the signal to its tool process (the same cancel mechanism as
-// CallWithContext). The channel is then closed without waiting for further
+// can propagate the signal to its tool process (the same cancel mechanism,
+// with the same proof, as CallWithContext). The channel is then closed without waiting for further
 // frames.
 //
 // the streaming RPC support.
@@ -794,11 +812,44 @@ func (m *Mesh) reRegisterTools() {
 	m.logf("[mesh] reconnect re-registration complete")
 }
 
-// UnregisterTool removes a tool's service registration from the mesh.
-// Returns true if the tool was found and removed, false if not found.
+// forgetRegistrationLocked drops the registration saved for toolName, so a
+// reconnect does not restore it. Must be called with m.mu held.
+func (m *Mesh) forgetRegistrationLocked(toolName string) {
+	kept := m.registrations[:0]
+	for _, reg := range m.registrations {
+		if reg.name != toolName {
+			kept = append(kept, reg)
+		}
+	}
+	for i := len(kept); i < len(m.registrations); i++ {
+		m.registrations[i] = toolRegistration{} // release the handler
+	}
+	m.registrations = kept
+}
+
+// dropNodeSubsLocked unsubscribes the node-targeted subscriptions of
+// toolName's methods. Must be called with m.mu held.
+func (m *Mesh) dropNodeSubsLocked(toolName string) {
+	prefix := fmt.Sprintf("node.%s.tools.%s.", m.nodeName, toolName)
+	remaining := m.nodeSubs[:0]
+	for _, sub := range m.nodeSubs {
+		if strings.HasPrefix(sub.Subject, prefix) {
+			sub.Unsubscribe()
+		} else {
+			remaining = append(remaining, sub)
+		}
+	}
+	m.nodeSubs = remaining
+}
+
+// UnregisterTool removes a tool's service registration from the mesh, and
+// the registration saved for it, so a reconnect does not bring the tool
+// back. Returns true if the tool was found and removed, false if not found.
 func (m *Mesh) UnregisterTool(toolName string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	m.forgetRegistrationLocked(toolName)
 
 	found := false
 	for i, svc := range m.services {
@@ -811,17 +862,7 @@ func (m *Mesh) UnregisterTool(toolName string) bool {
 		}
 	}
 
-	// Also unsubscribe node-targeted subscriptions for this tool
-	prefix := fmt.Sprintf("node.%s.tools.%s.", m.nodeName, toolName)
-	remaining := m.nodeSubs[:0]
-	for _, sub := range m.nodeSubs {
-		if sub.Subject == "" || len(sub.Subject) < len(prefix) || sub.Subject[:len(prefix)] != prefix {
-			remaining = append(remaining, sub)
-		} else {
-			sub.Unsubscribe()
-		}
-	}
-	m.nodeSubs = remaining
+	m.dropNodeSubsLocked(toolName)
 
 	return found
 }

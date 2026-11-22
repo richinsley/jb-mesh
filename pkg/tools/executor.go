@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -82,6 +83,10 @@ func (e *Executor) SetNATSURL(url string) {
 // configStore provides tool config resolution
 var configStore = NewToolConfigStore()
 
+// ErrInvalidConfig is wrapped by the error a start or a call returns when the
+// tool was not started because its configuration does not resolve.
+var ErrInvalidConfig = errors.New("invalid tool configuration")
+
 // getEnv returns environment variables to pass to Python processes
 func (e *Executor) getEnv() map[string]string {
 	return map[string]string{
@@ -93,17 +98,31 @@ func (e *Executor) getEnv() map[string]string {
 // Config is injected as JB_TOOL_CONFIG (JSON string).
 // JB_NATS_URL is injected so tools can connect directly to NATS for
 // file store (Object Store) and event emission.
-func (e *Executor) getToolEnv(tool *Tool) map[string]string {
+//
+// A configuration that does not resolve is an error, and the tool is not
+// started. The alternative is starting it with no JB_TOOL_CONFIG at all, its
+// declared defaults included: a service that takes a data location or an
+// address from its configuration would then run on whatever it assumes when
+// it has none. What does not resolve: a config.json that cannot be read or
+// parsed, a key the manifest does not declare, a value of the wrong type or
+// outside its enum, or a required field with no value.
+func (e *Executor) getToolEnv(tool *Tool) (map[string]string, error) {
 	env := e.getEnv()
 	if e.natsURL != "" {
 		env["JB_NATS_URL"] = e.natsURL
 	}
 	cfg, err := configStore.Resolve(tool, nil)
-	if err == nil && len(cfg) > 0 {
-		data, _ := json.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("tool %s not started: %w: %v", tool.Name, ErrInvalidConfig, err)
+	}
+	if len(cfg) > 0 {
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("tool %s not started: %w: %v", tool.Name, ErrInvalidConfig, err)
+		}
 		env["JB_TOOL_CONFIG"] = string(data)
 	}
-	return env
+	return env, nil
 }
 
 // Call executes a method on a tool
@@ -254,10 +273,14 @@ func (e *Executor) CallStream(ctx context.Context, toolName, methodName string, 
 
 // callOneshot runs a tool for a single call using jb-service protocol
 func (e *Executor) callOneshot(tool *Tool, methodName string, params map[string]interface{}) (interface{}, error) {
+	toolEnv, err := e.getToolEnv(tool)
+	if err != nil {
+		return nil, err
+	}
 	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
 
 	// Create REPL process - no module needed, we run main.py directly
-	repl, err := tool.Env.NewREPLPythonProcess(nil, e.getToolEnv(tool), nil, nil)
+	repl, err := tool.Env.NewREPLPythonProcess(nil, toolEnv, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create REPL: %w", err)
 	}
@@ -287,6 +310,10 @@ func (e *Executor) callPersistent(tool *Tool, methodName string, params map[stri
 
 // callOneshotMsgpack runs a tool for a single call using MessagePack transport
 func (e *Executor) callOneshotMsgpack(tool *Tool, methodName string, params map[string]interface{}) (interface{}, error) {
+	toolEnv, err := e.getToolEnv(tool)
+	if err != nil {
+		return nil, err
+	}
 	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
 
 	// Create module from entrypoint
@@ -303,7 +330,7 @@ func (e *Executor) callOneshotMsgpack(tool *Tool, methodName string, params map[
 	}
 
 	// Create queue process
-	queue, err := tool.Env.NewQueueProcess(program, nil, e.getToolEnv(tool), nil)
+	queue, err := tool.Env.NewQueueProcess(program, nil, toolEnv, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create queue process: %w", err)
 	}
@@ -513,7 +540,11 @@ func (e *Executor) Start(toolName string) error {
 
 // startRepl starts a tool with REPL transport
 func (e *Executor) startRepl(tool *Tool) error {
-	repl, err := tool.Env.NewREPLPythonProcess(nil, e.getToolEnv(tool), nil, nil)
+	toolEnv, err := e.getToolEnv(tool)
+	if err != nil {
+		return err
+	}
+	repl, err := tool.Env.NewREPLPythonProcess(nil, toolEnv, nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create REPL: %w", err)
 	}
@@ -552,6 +583,10 @@ func (e *Executor) startRepl(tool *Tool) error {
 
 // startMsgpack starts a tool with MessagePack transport
 func (e *Executor) startMsgpack(tool *Tool) error {
+	toolEnv, err := e.getToolEnv(tool)
+	if err != nil {
+		return err
+	}
 	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
 
 	// Create module from entrypoint
@@ -568,7 +603,7 @@ func (e *Executor) startMsgpack(tool *Tool) error {
 	}
 
 	// Create queue process
-	queue, err := tool.Env.NewQueueProcess(program, nil, e.getToolEnv(tool), nil)
+	queue, err := tool.Env.NewQueueProcess(program, nil, toolEnv, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create queue process: %w", err)
 	}

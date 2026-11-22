@@ -87,6 +87,25 @@ x-deploy:
 - runtime dependencies install into a temporary clean venv
 - the entrypoint imports successfully
 
+## Configuration
+
+Declare configuration keys in the manifest's `config` section. The node passes the resolved values to the service's process as JSON in the `JB_TOOL_CONFIG` environment variable:
+
+```python
+import json
+import os
+
+config = json.loads(os.environ.get("JB_TOOL_CONFIG") or "{}")
+```
+
+The node does not start a service whose configuration is invalid, so a service is never started with part of its configuration. See [`docs/tool-configuration.md`](../../../../docs/tool-configuration.md).
+
+## When a method fails
+
+Raise an exception. The caller is sent the exception's type and message, for example `ValueError: unknown collection "notes"`. The traceback is not sent: it names files on the node, so it goes to the service's stderr and the node's log.
+
+Write the message for the caller. Do not put paths, secrets or the content being processed in it.
+
 ## Lifecycle hooks
 
 Use lifecycle hooks for startup and cleanup:
