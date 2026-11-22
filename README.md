@@ -242,6 +242,8 @@ See [`docs/service-lifecycle.md`](docs/service-lifecycle.md) for the exact lifec
 - [`docs/authoring/service-starter.md`](docs/authoring/service-starter.md) — canonical service authoring path
 - [`docs/authoring/preflight.md`](docs/authoring/preflight.md) — what preflight checks and how it fits into tool development
 - [`docs/service-lifecycle.md`](docs/service-lifecycle.md) — service shutdown and hard-kill guarantees
+- [`docs/tool-configuration.md`](docs/tool-configuration.md) — tool configuration, and what happens when it is invalid
+- [`docs/reply-and-cancel-settings.md`](docs/reply-and-cancel-settings.md) — reply isolation, reply tokens and cancel proofs for a mesh with more than one principal
 - [`sdk/python/`](sdk/python/) — visible Python SDK source and service-author documentation
 - [`docs/nats-websocket.md`](docs/nats-websocket.md) — WebSocket transport notes
 - [`examples/`](examples/) — minimal example services

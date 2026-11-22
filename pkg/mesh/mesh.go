@@ -233,8 +233,9 @@ type CallRequest struct {
 
 	// CallID, if set, identifies this call for cancellation routing. When the
 	// caller's context fires, it publishes an empty message to
-	// `cancel.<CallID>` and the serving node subscribes to that subject for the
-	// duration of the call. Empty for non-cancellable calls.
+	// `cancel.<CallID>`, carrying the call's cancel proof
+	// (replytoken.CancelMessage), and the serving node subscribes to that
+	// subject for the duration of the call. Empty for non-cancellable calls.
 	CallID string `json:"call_id,omitempty"`
 
 	// ReplyToken is the reply token the request arrived with, set by the
@@ -246,6 +247,12 @@ type CallRequest struct {
 // CancelSubject returns the NATS subject a caller publishes to in order to
 // signal cancellation of a specific in-flight call. The serving node
 // subscribes to the same subject for the call's lifetime.
+//
+// The subject alone is not enough. A call that carried a reply token is
+// cancelled only by a message that also carries its proof, so build the
+// message with replytoken.CancelMessage; a bare publish here is ignored and
+// counted by the node. A call that carried no token is cancelled by any
+// message, unless the node sets RequireCancelProof, and then by none.
 func CancelSubject(callID string) string {
 	return "cancel." + callID
 }
@@ -477,8 +484,9 @@ func (m *Mesh) Call(toolName, method string, params map[string]interface{}, time
 }
 
 // CallWithContext is like Call but propagates ctx cancellation to the serving
-// node via a NATS publish to `cancel.<call_id>`. The serving node subscribes
-// to that subject for the call's duration and forwards the signal to its
+// node via a NATS publish to `cancel.<call_id>`, carrying the proof made from
+// this call's reply token. The serving node subscribes to that subject for
+// the call's duration and forwards a cancel that passes its check to its
 // jumpboot tool process (where a cooperatively-cancellable method can stop
 // early).
 //
@@ -487,9 +495,6 @@ func (m *Mesh) Call(toolName, method string, params map[string]interface{}, time
 // after best-effort publishing the cancel signal — it does not wait for the
 // server to acknowledge cancellation. Callers needing a hard deadline should
 // derive ctx with context.WithTimeout.
-//
-// Part of Phase 1 of the streaming+cancellation design — see
-// the streaming and cancellation design.
 func (m *Mesh) CallWithContext(ctx context.Context, toolName, method string, params map[string]interface{}, targetNode ...string) (*CallResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -544,11 +549,13 @@ func (m *Mesh) CallWithContext(ctx context.Context, toolName, method string, par
 // subject (or its node-targeted variant when targetNode is set), which the
 // serving node only registers for methods declared with `stream: true` in
 // their manifest. Calls to non-streaming methods on the stream subject get
-// no responder.
+// no responder: the stream ends at once with an error frame, or, with
+// RequireReplyToken set, only when ctx ends, because the server's "no
+// responders" status carries no token.
 //
 // On ctx.Done, Stream publishes to `cancel.<call_id>` so the serving node
-// can propagate the signal to its tool process (the same cancel mechanism as
-// CallWithContext). The channel is then closed without waiting for further
+// can propagate the signal to its tool process (the same cancel mechanism,
+// with the same proof, as CallWithContext). The channel is then closed without waiting for further
 // frames.
 //
 // the streaming RPC support.
