@@ -1333,14 +1333,27 @@ func (n *Node) HandleConfig(toolName, action string, values map[string]interface
 				n.logf("[node] warning: failed to emit tool.configured: %v", err)
 			}
 		}
-		// If tool is running and persistent, restart it to pick up new config
-		if tool.Status == "running" && tool.Manifest.Runtime.Mode == "persistent" {
-			n.logf("[node] config changed for running tool %s — restarting", toolName)
-			if err := n.executor.Stop(toolName); err != nil {
-				return nil, fmt.Errorf("failed to stop for config reload: %w", err)
-			}
-			if err := n.executor.Start(toolName); err != nil {
-				return nil, fmt.Errorf("failed to restart after config change: %w", err)
+		// A persistent tool is restarted to pick up the new config. One that
+		// is not running is started: a tool whose configuration did not
+		// resolve was refused at start (tools.ErrInvalidConfig) and may never
+		// have been registered, and setting a configuration that does resolve
+		// is how it is brought up. It is registered the way an update
+		// registers it.
+		if tool.Manifest.Runtime.Mode == "persistent" {
+			if tool.Status == "running" {
+				n.logf("[node] config changed for running tool %s — restarting", toolName)
+				if err := n.executor.Stop(toolName); err != nil {
+					return nil, fmt.Errorf("failed to stop for config reload: %w", err)
+				}
+				if err := n.executor.Start(toolName); err != nil {
+					return nil, fmt.Errorf("failed to restart after config change: %w", err)
+				}
+			} else {
+				n.logf("[node] config changed for tool %s, which is not running — starting", toolName)
+				n.mesh.UnregisterTool(toolName)
+				if err := n.registerTool(tool); err != nil {
+					return nil, fmt.Errorf("config saved, but the tool did not start: %w", err)
+				}
 			}
 		}
 		return store.Resolve(tool, nil)
