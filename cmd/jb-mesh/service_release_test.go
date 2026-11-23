@@ -17,6 +17,18 @@ func writeServiceManifest(t *testing.T, dir, name string) {
 	}
 }
 
+// resolved is a path with its symbolic links followed. A temporary folder is often reached
+// through one (/var and /private/var on macOS), and the resolver follows links, so the two
+// spellings of one folder must compare equal.
+func resolved(t *testing.T, path string) string {
+	t.Helper()
+	out, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", path, err)
+	}
+	return out
+}
+
 func TestResolveReleaseSubjectFromDirectSubdirPath(t *testing.T) {
 	home := t.TempDir()
 	repo := filepath.Join(t.TempDir(), "repo")
@@ -30,8 +42,8 @@ func TestResolveReleaseSubjectFromDirectSubdirPath(t *testing.T) {
 	if subject.Name != "demo" {
 		t.Fatalf("expected demo, got %s", subject.Name)
 	}
-	if subject.RepoPath != svcDir {
-		t.Fatalf("expected repo path %s, got %s", svcDir, subject.RepoPath)
+	if want := resolved(t, svcDir); resolved(t, subject.RepoPath) != want {
+		t.Fatalf("expected repo path %s, got %s", want, subject.RepoPath)
 	}
 }
 
@@ -54,7 +66,7 @@ func TestResolveReleaseSubjectFromTargetSubdir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveReleaseSubject: %v", err)
 	}
-	if subject.RepoPath != svcDir {
-		t.Fatalf("expected repo path %s, got %s", svcDir, subject.RepoPath)
+	if want := resolved(t, svcDir); resolved(t, subject.RepoPath) != want {
+		t.Fatalf("expected repo path %s, got %s", want, subject.RepoPath)
 	}
 }

@@ -339,6 +339,24 @@ if __name__ == "__main__":
 			done <- err
 		}()
 		callID := <-ids
+		// The tool is asked, not timed: wait until it says the call is running
+		// in it. How long a first call takes to get there varies with the
+		// machine, and a count of steps taken by some moment proves nothing.
+		running := func(why string) map[string]interface{} {
+			t.Helper()
+			deadline := time.Now().Add(20 * time.Second)
+			for {
+				last := lastWait()
+				if last["running"] == true {
+					return last
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%s: the tool does not report the call running: %v", why, last)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		running("before anyone cancels")
 		// Another principal knows the live call id and tells the node to
 		// stop: with nothing, and with a made-up proof. (It waits a moment
 		// first: it saw the request as soon as the node did, and the node's
@@ -361,6 +379,10 @@ if __name__ == "__main__":
 		if got := leaf.IgnoredCancels() - before; got != 2 {
 			t.Fatalf("the node ignored %d cancel(s), want 2", got)
 		}
+		// And the tool itself is still at it: neither cancel reached it.
+		if last := running("after another principal's cancels"); last["cancelled"] == true {
+			t.Fatalf("the tool was stopped by another principal's cancel: %v", last)
+		}
 		// The requester cancels. Its call returns, and the tool itself stops.
 		cancel()
 		select {
@@ -375,7 +397,7 @@ if __name__ == "__main__":
 		for {
 			last := lastWait()
 			if last["cancelled"] == true {
-				if steps, _ := last["steps"].(float64); steps >= 200 || steps < 5 {
+				if steps, _ := last["steps"].(float64); steps >= 200 { // stopped early, not run out
 					t.Fatalf("the tool reports %v", last)
 				}
 				break
