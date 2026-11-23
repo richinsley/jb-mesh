@@ -110,9 +110,15 @@ type FileListItem struct {
 }
 
 // SubscribeFileHandlers registers all file store request handlers on the NATS connection.
-// The handlers are not node-scoped — any node with a file store can serve requests.
-// Since all nodes share the same NATS Object Store bucket, it doesn't matter which
-// node handles the request.
+// The handlers are not node-scoped, and they are plain subscriptions, not a queue group:
+// every node that serves the file store receives every request, acts on it against its
+// own handle on the store, and answers. A caller making an ordinary request sees only the
+// first answer.
+//
+// That is sound when all the nodes share one NATS Object Store bucket, which is what this
+// package assumes: a put is written more than once with the same bytes, a delete is asked
+// for more than once, and the answers agree. Where providers do not share a bucket, each
+// acts on its own, and the one answer a caller sees speaks for one of them only.
 func (m *Mesh) SubscribeFileHandlers(store *filestore.Store) error {
 	if err := m.subscribeFilePut(store); err != nil {
 		return fmt.Errorf("subscribe files.put: %w", err)
