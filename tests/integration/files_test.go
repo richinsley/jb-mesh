@@ -1,10 +1,18 @@
 // Package integration provides end-to-end tests for file handling (P4-007f).
 //
-// These tests require a running jb-mesh node with sysinfo installed.
-// They connect to NATS as a client and exercise the full stack:
-// Go NATS handlers → jumpboot → Python tool → attach_file → Object Store → NATS get
+// The file store tests run against a node this test starts itself: loopback, ports of its
+// own choosing, a temporary home, no mDNS. They reach nothing they did not start.
 //
-// Skip with: JB_MESH_SKIP_INTEGRATION=1 or when NATS is unreachable.
+// To run them against another mesh, and to run the two tests that need the sysinfo example
+// tool installed there, name it:
+//
+//	JB_MESH_TEST_NATS_URL=nats://127.0.0.1:14222 go test ./tests/integration/
+//
+// Only that variable is read. The tests used to connect to nats://localhost:4222, or to
+// whatever NATS_URL held, and skip only when nothing answered: on a machine running a real
+// mesh they put, read and deleted files in its file store and called tools on it.
+//
+// Skip with: JB_MESH_SKIP_INTEGRATION=1.
 package integration
 
 import (
@@ -15,15 +23,18 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/richinsley/jb-mesh/pkg/node"
 )
 
 const (
-	defaultNATSURL = "nats://localhost:4222"
-	timeout        = 15 * time.Second
+	testMeshEnv = "JB_MESH_TEST_NATS_URL"
+	timeout     = 15 * time.Second
 )
 
 // --- NATS request/response types (mirror pkg/mesh) ---
@@ -95,11 +106,48 @@ type FileDeleteResult struct {
 
 // --- Test helpers ---
 
-func getNATSURL() string {
-	if url := os.Getenv("NATS_URL"); url != "" {
+var (
+	ownMesh     sync.Once
+	ownMeshNode *node.Node
+	ownMeshURL  string
+	ownMeshHome string
+	ownMeshErr  error
+)
+
+// meshURL is the mesh the file tests talk to: the one named in JB_MESH_TEST_NATS_URL, or a
+// node started here on loopback. There is no default address.
+func meshURL(t *testing.T) string {
+	t.Helper()
+	if url := os.Getenv(testMeshEnv); url != "" {
 		return url
 	}
-	return defaultNATSURL
+	ownMesh.Do(func() {
+		ownMeshHome, ownMeshErr = os.MkdirTemp("", "jb-mesh-files-test-")
+		if ownMeshErr != nil {
+			return
+		}
+		ownMeshNode, ownMeshErr = node.New(node.Config{HomeDir: ownMeshHome, NodeName: "files-test", Role: "seed", NoMDNS: true,
+			EmbedHost: "127.0.0.1", EmbedPort: -1, LeafHost: "127.0.0.1", LeafPort: -1,
+			Logging: node.LoggingConfig{Quiet: true}})
+		if ownMeshErr == nil {
+			ownMeshURL = ownMeshNode.Mesh().Conn().ConnectedUrl()
+		}
+	})
+	if ownMeshErr != nil {
+		t.Fatalf("start a node for the file tests: %v", ownMeshErr)
+	}
+	return ownMeshURL
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if ownMeshNode != nil {
+		ownMeshNode.Close()
+	}
+	if ownMeshHome != "" {
+		os.RemoveAll(ownMeshHome)
+	}
+	os.Exit(code)
 }
 
 func skipIfNoNATS(t *testing.T) {
@@ -107,16 +155,19 @@ func skipIfNoNATS(t *testing.T) {
 	if os.Getenv("JB_MESH_SKIP_INTEGRATION") == "1" {
 		t.Skip("skipping integration test (JB_MESH_SKIP_INTEGRATION=1)")
 	}
-	nc, err := nats.Connect(getNATSURL(), nats.Timeout(2*time.Second))
-	if err != nil {
-		t.Skipf("skipping: NATS not available at %s: %v", getNATSURL(), err)
+}
+
+// needsNamedMesh skips a test that calls a tool this test cannot install itself.
+func needsNamedMesh(t *testing.T, tool string) {
+	t.Helper()
+	if os.Getenv(testMeshEnv) == "" {
+		t.Skipf("skipping: needs a mesh with the %s example tool installed; name one in %s", tool, testMeshEnv)
 	}
-	nc.Close()
 }
 
 func connect(t *testing.T) *nats.Conn {
 	t.Helper()
-	nc, err := nats.Connect(getNATSURL(), nats.Timeout(5*time.Second))
+	nc, err := nats.Connect(meshURL(t), nats.Timeout(5*time.Second))
 	if err != nil {
 		t.Fatalf("connect to NATS: %v", err)
 	}
@@ -224,6 +275,7 @@ func TestFileStoreCRUD(t *testing.T) {
 
 func TestToolProducesImage(t *testing.T) {
 	skipIfNoNATS(t)
+	needsNamedMesh(t, "sysinfo")
 	nc := connect(t)
 
 	// Call sysinfo.test_image_output — Python generates PNG, calls attach_file
@@ -284,6 +336,7 @@ func TestToolProducesImage(t *testing.T) {
 
 func TestToolProducesTextFile(t *testing.T) {
 	skipIfNoNATS(t)
+	needsNamedMesh(t, "sysinfo")
 	nc := connect(t)
 
 	result := natsRequest[CallRequest, CallResult](t, nc, "tools.sysinfo.test_file_output", CallRequest{

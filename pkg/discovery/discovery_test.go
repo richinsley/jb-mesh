@@ -1,10 +1,18 @@
 package discovery
 
 import (
+	"fmt"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
 )
+
+// testServiceType is the mDNS service type every test here that advertises or browses uses:
+// one of this test run's own. Under the real type (_jb-mesh._tcp) a test advertised made-up
+// nodes on the network where real nodes look for a seed, and saw the real nodes of whatever
+// mesh runs nearby among its own results.
+var testServiceType = fmt.Sprintf("_jbmt%06x._tcp", rand.Intn(1<<24))
 
 func TestNewDiscovery_Defaults(t *testing.T) {
 	d, err := NewDiscovery(DiscoveryConfig{
@@ -125,10 +133,11 @@ func TestAdvertiseAndDiscover(t *testing.T) {
 
 	// Start node A advertising
 	dA, err := NewDiscovery(DiscoveryConfig{
-		NodeName:  "test-node-a",
-		NATSPort:  14222,
-		Version:   "v0.1.0",
-		ToolCount: 3,
+		ServiceType: testServiceType,
+		NodeName:    "test-node-a",
+		NATSPort:    14222,
+		Version:     "v0.1.0",
+		ToolCount:   3,
 	})
 	if err != nil {
 		t.Fatalf("create discovery A: %v", err)
@@ -144,8 +153,9 @@ func TestAdvertiseAndDiscover(t *testing.T) {
 
 	// Node B browses and should find node A
 	dB, err := NewDiscovery(DiscoveryConfig{
-		NodeName: "test-node-b",
-		NATSPort: 14223,
+		ServiceType: testServiceType,
+		NodeName:    "test-node-b",
+		NATSPort:    14223,
 	})
 	if err != nil {
 		t.Fatalf("create discovery B: %v", err)
@@ -180,10 +190,11 @@ func TestTwoDiscoveriesFindEachOther(t *testing.T) {
 	foundByB := make(map[string]bool)
 
 	dA, err := NewDiscovery(DiscoveryConfig{
-		NodeName:  "mutual-a",
-		NATSPort:  24222,
-		Version:   "v0.2.0",
-		ToolCount: 1,
+		ServiceType: testServiceType,
+		NodeName:    "mutual-a",
+		NATSPort:    24222,
+		Version:     "v0.2.0",
+		ToolCount:   1,
 	})
 	if err != nil {
 		t.Fatalf("create A: %v", err)
@@ -195,10 +206,11 @@ func TestTwoDiscoveriesFindEachOther(t *testing.T) {
 	})
 
 	dB, err := NewDiscovery(DiscoveryConfig{
-		NodeName:  "mutual-b",
-		NATSPort:  24223,
-		Version:   "v0.2.0",
-		ToolCount: 2,
+		ServiceType: testServiceType,
+		NodeName:    "mutual-b",
+		NATSPort:    24223,
+		Version:     "v0.2.0",
+		ToolCount:   2,
 	})
 	if err != nil {
 		t.Fatalf("create B: %v", err)
@@ -249,8 +261,9 @@ func TestPeerCallbackFires(t *testing.T) {
 	}
 
 	dA, err := NewDiscovery(DiscoveryConfig{
-		NodeName: "callback-advertiser",
-		NATSPort: 34222,
+		ServiceType: testServiceType,
+		NodeName:    "callback-advertiser",
+		NATSPort:    34222,
 	})
 	if err != nil {
 		t.Fatalf("create A: %v", err)
@@ -264,8 +277,9 @@ func TestPeerCallbackFires(t *testing.T) {
 
 	found := make(chan Peer, 1)
 	dB, err := NewDiscovery(DiscoveryConfig{
-		NodeName: "callback-browser",
-		NATSPort: 34223,
+		ServiceType: testServiceType,
+		NodeName:    "callback-browser",
+		NATSPort:    34223,
 	})
 	if err != nil {
 		t.Fatalf("create B: %v", err)
@@ -296,8 +310,9 @@ func TestPeerCallbackFires(t *testing.T) {
 
 func TestStopCleansUp(t *testing.T) {
 	d, err := NewDiscovery(DiscoveryConfig{
-		NodeName: "cleanup-node",
-		NATSPort: 44222,
+		ServiceType: testServiceType,
+		NodeName:    "cleanup-node",
+		NATSPort:    44222,
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -337,8 +352,9 @@ func TestSelfFiltering(t *testing.T) {
 	}
 
 	d, err := NewDiscovery(DiscoveryConfig{
-		NodeName: "self-filter-node",
-		NATSPort: 54222,
+		ServiceType: testServiceType,
+		NodeName:    "self-filter-node",
+		NATSPort:    54222,
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
